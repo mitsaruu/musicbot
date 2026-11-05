@@ -1,0 +1,8 @@
+# Секреты и данные бота — их нельзя выкладывать в интернет
+start.bat
+levels.db
+levels.db-journal
+
+# Служебные папки Python
+__pycache__/
+venv/

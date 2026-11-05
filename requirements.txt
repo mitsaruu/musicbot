@@ -1,0 +1,6 @@
+discord.py[voice]>=2.7
+yt-dlp[default]
+spotipy
+Pillow
+google-genai
+tzdata
