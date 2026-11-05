@@ -6,3 +6,6 @@ levels.db-journal
 # Служебные папки Python
 __pycache__/
 venv/
+
+# Логи ошибок бота
+bot.log*

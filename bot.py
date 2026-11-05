@@ -8,6 +8,7 @@
 #  Деньги:  /work, /balance, /give_money, /money_leaderboard, /coinflip, /slots, /blackjack
 #  Каждый день: /daily_setup, /daily_off, /daily_test — утренние и вечерние сообщения с фактами
 #  Каналы:  /games_channel — ранги, рейтинги и игры работают только в выбранном канале
+#           /log_channel — куда бот присылает свои ошибки (а ещё они всегда пишутся в bot.log)
 #  ИИ:      характер тсундере; /ask, /ai_limits, а также ответ, если упомянуть бота (@бот) или ответить ему
 #           память: /remember, /memory, /forget (бот помнит разговор и факты о людях)
 #           картинки: бот видит изображения в сообщении и в том, на которое ответили
@@ -23,6 +24,10 @@ import random    # случайные числа (сколько опыта да
 import re        # "регулярные выражения" — поиск шаблонов в тексте (ссылки Spotify, слова для автоответов)
 import sqlite3   # встроенная в Python база данных — в ней храним опыт участников
 import time      # текущее время (для защиты от накрутки опыта)
+import logging   # запись ошибок в файл bot.log
+import sys       # sys.exc_info() — узнать, какая ошибка сейчас случилась
+import traceback # подробности ошибки: в каком файле и на какой строке она произошла
+from logging.handlers import RotatingFileHandler  # файл логов, который не разрастается бесконечно
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps  # Pillow — библиотека для рисования картинок
 
@@ -330,10 +335,74 @@ class BotTree(app_commands.CommandTree):
     async def interaction_check(self, interaction):
         return await games_channel_check(interaction)
 
+    async def on_error(self, interaction, error):
+        """Вызывается, если внутри слэш-команды случилась ошибка, которую никто не поймал."""
+        if isinstance(error, app_commands.CheckFailure):  # например, команду вызвали не там — это не поломка
+            return
+        error = getattr(error, "original", error)  # discord.py заворачивает ошибку — достаём настоящую
+        name = interaction.command.qualified_name if interaction.command else "?"
+        await report_error(f"Команда /{name}", error, interaction.guild, interaction.user, interaction.channel)
+        text = "😵 Что-то пошло не так. Ошибка уже записана в логи."
+        try:
+            if interaction.response.is_done():  # на команду уже начали отвечать — пишем новым сообщением
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            pass  # ответить не получилось (например, команда устарела) — в логах ошибка всё равно есть
+
 
 # Создаём бота. command_prefix здесь не используется, но его обязательно нужно указать.
 # tree_cls=BotTree — используем наше "дерево" команд с проверкой канала.
 bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=BotTree)
+
+
+# ============================================================
+#  Логи ошибок
+#  Каждая ошибка пишется в консоль и в файл bot.log (рядом с bot.py; старые записи
+#  уходят в bot.log.1, bot.log.2...). Если на сервере выбрали канал командой /log_channel,
+#  бот ещё и присылает туда карточку: где случилась ошибка, у кого и подробности.
+# ============================================================
+error_logger = logging.getLogger("musicbot")
+error_logger.setLevel(logging.INFO)
+_log_file = RotatingFileHandler(os.path.join(BASE_DIR, "bot.log"),
+                                maxBytes=2_000_000, backupCount=3, encoding="utf-8")  # до 2 МБ на файл
+_log_file.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+error_logger.addHandler(_log_file)
+
+
+def log_channel_for(guild_id):
+    """Канал для логов на сервере (объект канала) или None, если его не выбирали или удалили."""
+    if guild_id is None:
+        return None
+    row = db.execute("SELECT channel_id FROM log_channel WHERE guild_id = ?", (guild_id,)).fetchone()
+    return bot.get_channel(row[0]) if row else None
+
+
+async def report_error(where, error, guild=None, user=None, channel=None):
+    """Записывает ошибку в консоль и bot.log и присылает её в канал логов сервера (если он выбран).
+    where — где случилась ошибка (например, "ИИ /ask"); guild — сервер (объект или id); user и channel — по желанию."""
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
+    guild_id = getattr(guild, "id", guild)  # можно передать и сам сервер, и просто его id
+    print(f"{where}: {error!r}")
+    error_logger.error("%s | сервер=%s | пользователь=%s | канал=%s\n%s",
+                       where, guild_id, getattr(user, "id", user), getattr(channel, "id", channel), details)
+
+    log_channel = log_channel_for(guild_id)
+    if log_channel is None:
+        return
+    embed = discord.Embed(title=f"⚠️ Ошибка: {where}"[:256], color=0xEF4444,
+                          timestamp=datetime.datetime.now(datetime.timezone.utc))
+    embed.add_field(name="Что случилось", value=f"`{type(error).__name__}`: {str(error)[:900] or '—'}", inline=False)
+    if user is not None:
+        embed.add_field(name="Кто", value=getattr(user, "mention", str(user)))
+    if channel is not None:
+        embed.add_field(name="Где", value=getattr(channel, "mention", str(channel)))
+    embed.description = f"```py\n{details[-3800:]}\n```"  # конец трейсбэка — самое важное место
+    try:
+        await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())  # без пингов
+    except Exception as send_error:
+        print("Не получилось отправить лог в канал:", send_error)
 
 # Громкость для каждого сервера в процентах. Ключ — id сервера, значение — число (100 = обычная громкость).
 volumes = {}
@@ -614,6 +683,14 @@ db.execute("""
     )
 """)
 
+# Канал, куда бот присылает ошибки, на каждом сервере (/log_channel).
+db.execute("""
+    CREATE TABLE IF NOT EXISTS log_channel (
+        guild_id   INTEGER PRIMARY KEY,
+        channel_id INTEGER
+    )
+""")
+
 # Сколько запросов к ИИ (Google) бот отправил за день — для команды /ai_limits.
 db.execute("""
     CREATE TABLE IF NOT EXISTS ai_stats (
@@ -786,7 +863,7 @@ async def voice_xp_loop():
                     await give_xp(member, VOICE_XP_PER_MINUTE, channel)
                 except Exception as error:
                     # Ошибка с одним участником не должна останавливать начисление остальным
-                    print("Ошибка начисления опыта за голос:", error)
+                    await report_error("Опыт за голосовой канал", error, member.guild, member, channel)
 
 
 @voice_xp_loop.before_loop
@@ -1717,14 +1794,14 @@ def is_supported_image(attachment):
     return image_type(attachment) in AI_IMAGE_TYPES and attachment.size <= AI_MAX_IMAGE_MB * 1024 * 1024
 
 
-async def download_images(attachments):
+async def download_images(attachments, guild=None):
     """Скачивает картинки из Discord. Возвращает список пар (байты картинки, формат)."""
     images = []
     for attachment in attachments[:AI_MAX_IMAGES]:  # не больше AI_MAX_IMAGES штук
         try:
             images.append((await attachment.read(), image_type(attachment)))  # read() — скачать вложение
         except Exception as error:
-            print("Не получилось скачать картинку:", error)
+            await report_error("Скачивание картинки для ИИ", error, guild)
     return images
 
 
@@ -1864,7 +1941,7 @@ async def ai_reply(message):
         question = "(прислал картинку без текста)" if attachments else "(просто позвал тебя, ничего не написав)"
 
     async with message.channel.typing():  # показываем "бот печатает...", пока ИИ думает
-        images = await download_images(attachments)
+        images = await download_images(attachments, message.guild)
         try:
             context = await chat_context(message.channel, message)
         except Exception:
@@ -1872,7 +1949,7 @@ async def ai_reply(message):
         try:
             answer = await ask_ai(question, message.author, message.channel.id, message.guild.id, context, images)
         except Exception as error:
-            print("Ошибка ИИ:", error)  # подробности — в консоль
+            await report_error("ИИ (ответ на сообщение)", error, message.guild, message.author, message.channel)
             answer = ai_error_text(error)
 
     parts = split_message(answer)
@@ -2169,7 +2246,7 @@ def zone(name):
         return datetime.timezone(datetime.timedelta(hours=DAILY_TIMEZONES.get(name, ("", 0))[1]))
 
 
-async def make_daily_text(kind):
+async def make_daily_text(kind, guild=None):
     """Текст утреннего (kind="morning") или вечернего ("evening") сообщения. Пишет ИИ, а без него — запасной вариант."""
     topic = random.choice(DAILY_TOPICS)
     today = datetime.date.today()
@@ -2193,7 +2270,7 @@ async def make_daily_text(kind):
             if text:
                 return text
         except Exception as error:
-            print("Ошибка ИИ (ежедневное сообщение):", error)
+            await report_error("ИИ (ежедневное сообщение)", error, guild)
             ai_error_text(error)  # чтобы /ai_limits знала, если Google отказал из-за лимита
     fact = random.choice(FALLBACK_FACTS)  # ИИ не ответил — берём запасной факт
     if kind == "morning":
@@ -2207,7 +2284,7 @@ async def send_daily(channel_id, kind):
     if channel is None:
         print("Ежедневные сообщения: не нашла канал", channel_id)
         return False
-    text = await make_daily_text(kind)
+    text = await make_daily_text(kind, channel.guild)
     if kind == "morning":
         embed = discord.Embed(title="☀️ Доброе утро!", description=text[:4000], color=0xF59E0B)
     else:
@@ -2216,7 +2293,7 @@ async def send_daily(channel_id, kind):
         await channel.send(embed=embed)
         return True
     except Exception as error:
-        print("Не получилось отправить ежедневное сообщение:", error)
+        await report_error("Отправка ежедневного сообщения", error, channel.guild, channel=channel)
         return False
 
 
@@ -2242,7 +2319,7 @@ async def daily_loop():
                     db.commit()
                     await send_daily(channel_id, kind)
         except Exception as error:  # ошибка на одном сервере не должна останавливать проверку остальных
-            print("Ошибка ежедневных сообщений:", error)
+            await report_error("Ежедневные сообщения", error, guild_id)
 
 
 @daily_loop.before_loop
@@ -2276,6 +2353,17 @@ async def setup_hook():
 async def on_ready():
     """Вызывается, когда бот успешно подключился к Discord."""
     print(f"Бот запущен как {bot.user}")
+
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    """Вызывается, если ошибка случилась в событии (например, при обработке сообщения в on_message)."""
+    error = sys.exc_info()[1]  # та ошибка, из-за которой нас вызвали
+    message = args[0] if args and isinstance(args[0], discord.Message) else None
+    if message:
+        await report_error(f"Событие {event}", error, message.guild, message.author, message.channel)
+    else:
+        await report_error(f"Событие {event}", error)
 
 
 # @bot.tree.command создаёт слэш-команду. name — как она называется, description — подсказка в Discord.
@@ -2314,7 +2402,7 @@ async def play(interaction: discord.Interaction, query: str):
         try:
             queries, name = await spotify_lookup(kind, spotify_id)  # узнаём названия песен
         except Exception as error:
-            print("Ошибка Spotify:", error)  # подробности пишем в консоль, чтобы было что прислать при проблеме
+            await report_error("Spotify /play", error, interaction.guild, interaction.user, interaction.channel)
             await interaction.followup.send("Не получилось получить данные из Spotify.")
             return
 
@@ -2530,12 +2618,12 @@ async def ask(interaction: discord.Interaction, question: str, image: discord.At
         return
 
     await interaction.response.defer()  # ИИ отвечает несколько секунд — показываем "бот думает..."
-    images = await download_images([image]) if image else []
+    images = await download_images([image], interaction.guild) if image else []
     try:
         answer = await ask_ai(question, interaction.user, interaction.channel_id, interaction.guild_id,
                               images=images)
     except Exception as error:
-        print("Ошибка ИИ:", error)
+        await report_error("ИИ /ask", error, interaction.guild, interaction.user, interaction.channel)
         answer = ai_error_text(error)
 
     parts = split_message(f"❓ {question}\n\n{answer}")  # сначала вопрос, потом ответ
@@ -2667,7 +2755,7 @@ async def weather(interaction: discord.Interaction, city: str | None = None):
         try:
             found = await find_city(city)
         except Exception as error:
-            print("Ошибка поиска города:", error)
+            await report_error("Поиск города /weather", error, interaction.guild, interaction.user, interaction.channel)
             found = None
         if found is None:
             await interaction.followup.send(f"Не нашёл город «{city}» 😕 Попробуй написать по-другому.")
@@ -2683,7 +2771,8 @@ async def weather(interaction: discord.Interaction, city: str | None = None):
         try:
             text = format_weather(await fetch_weather(latitude, longitude))
         except Exception as error:
-            print("Ошибка погоды:", error)
+            await report_error(f"Погода /weather ({name})", error, interaction.guild, interaction.user,
+                               interaction.channel)
             text = "Не получилось узнать погоду 😕"
         embed.add_field(name=name, value=text, inline=False)  # inline=False — каждый город с новой строки
     embed.set_footer(text="Данные: Open-Meteo")
@@ -2720,7 +2809,8 @@ async def weather_cities(interaction: discord.Interaction, action: app_commands.
         try:
             found = await find_city(city)
         except Exception as error:
-            print("Ошибка поиска города:", error)
+            await report_error("Поиск города /weather_cities", error, interaction.guild, interaction.user,
+                               interaction.channel)
             found = None
         if found is None:
             await interaction.followup.send(f"Не нашёл город «{city}» 😕 Попробуй написать по-другому.")
@@ -3155,6 +3245,34 @@ async def set_games_channel(interaction: discord.Interaction, channel: discord.T
     await interaction.response.send_message(
         f"✅ Теперь эти команды работают только в {channel.mention}:\n{command_list}\n"
         f"Чтобы снова разрешить их везде — вызови /games_channel без канала.")
+
+
+@bot.tree.command(name="log_channel", description="Канал, куда бот присылает свои ошибки (пусто — не присылать)")
+@app_commands.describe(channel="Канал для логов (лучше закрытый, только для админов). Пусто — выключить")
+@app_commands.default_permissions(manage_guild=True)  # команду видят только те, кто может управлять сервером
+@app_commands.guild_only()
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+    if channel is None:  # канал не выбрали — выключаем логи в Discord (в bot.log они пишутся всегда)
+        db.execute("DELETE FROM log_channel WHERE guild_id = ?", (interaction.guild.id,))
+        db.commit()
+        await interaction.response.send_message("✅ Больше не присылаю ошибки в Discord (в bot.log пишу как раньше).",
+                                                ephemeral=True)
+        return
+
+    permissions = channel.permissions_for(interaction.guild.me)  # что боту можно в этом канале
+    if not (permissions.view_channel and permissions.send_messages and permissions.embed_links):
+        await interaction.response.send_message(
+            f"Мне не хватает прав в {channel.mention}: нужны «Просматривать канал», «Отправлять сообщения» "
+            f"и «Встраивать ссылки».", ephemeral=True)
+        return
+
+    db.execute("""
+        INSERT INTO log_channel (guild_id, channel_id) VALUES (?, ?)
+        ON CONFLICT (guild_id) DO UPDATE SET channel_id = excluded.channel_id
+    """, (interaction.guild.id, channel.id))
+    db.commit()
+    await interaction.response.send_message(
+        f"✅ Теперь присылаю ошибки в {channel.mention}. Выключить — /log_channel без канала.", ephemeral=True)
 
 
 @bot.tree.command(name="leave", description="Выйти из канала (очередь сохранится)")
