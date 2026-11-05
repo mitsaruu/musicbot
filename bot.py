@@ -13,7 +13,9 @@
 #           память: /remember, /memory, /forget (бот помнит разговор и факты о людях)
 #           картинки: бот видит изображения в сообщении и в том, на которое ответили
 #  Автоответы на слова «привет» и «даня»
-#  Настройки: папка config — prompt.txt (характер ИИ), auto_replies.txt (автоответы), settings.ini (числа)
+#  Грубость: на мат и непотребства ИИ не отвечает (слова — в config/bad_words.txt, остальное решает сам ИИ)
+#  Настройки: папка config — prompt.txt (характер ИИ), auto_replies.txt (автоответы),
+#             bad_words.txt (слова, на которые бот молчит), settings.ini (числа)
 # ============================================================
 
 import asyncio   # стандартная библиотека Python для асинхронного кода (бот делает много дел "одновременно")
@@ -38,6 +40,7 @@ from discord.ext import commands, tasks  # commands — класс Bot, tasks �
 import yt_dlp                         # библиотека, которая находит видео на YouTube и достаёт ссылку на звук
 from google import genai                                # библиотека Google для работы с ИИ Gemini (пакет google-genai)
 from google.genai import types                          # настройки запроса к Gemini
+from google.genai import errors as genai_errors         # виды ошибок Gemini (например, ServerError — 503 "перегружен")
 import spotipy                                          # библиотека для работы с Spotify API
 from spotipy.oauth2 import SpotifyClientCredentials     # вход в Spotify API по ключам приложения
 
@@ -56,6 +59,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # папка, где л�
 CONFIG_DIR = os.path.join(BASE_DIR, "config")           # папка с настройками
 PROMPT_PATH = os.path.join(CONFIG_DIR, "prompt.txt")
 AUTO_REPLIES_PATH = os.path.join(CONFIG_DIR, "auto_replies.txt")
+BAD_WORDS_PATH = os.path.join(CONFIG_DIR, "bad_words.txt")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.ini")
 
 # Характер ИИ по умолчанию (если prompt.txt пустой или его нет)
@@ -85,6 +89,24 @@ DEFAULT_AUTO_REPLIES_FILE = """# Автоответы бота. Каждая с�
 даня = это который сидит на красном стуле?
 """
 
+DEFAULT_BAD_WORDS_FILE = """# Слова, на которые бот не отвечает: если к боту обратились с одним из них — ИИ промолчит.
+# Одно слово на строке (можно и через запятую). Звёздочка * — «любые буквы»:
+#   бля     — только само слово «бля»
+#   ебал*   — слова, которые НАЧИНАЮТСЯ с «ебал»: ебал, ебала, ебалом...
+#   *пизд*  — слова, в которых ВНУТРИ есть «пизд»
+# Осторожно со звёздочками с двух сторон: «*бля*» поймает и «употребляю».
+# Ё и Е считаются одной буквой, большие и маленькие буквы не важны.
+# Строки, которые начинаются с #, — пояснения. После сохранения файла перезапускать бота не нужно.
+# Замаскированный мат (х*й, х у й) и непотребства без матных слов ловит сам ИИ.
+
+хуй, хуя, хуи, хую, хуем, хуе*, *хуйн*, нахуй, похуй, дохуя, охуе*, охуи*
+*пизд*
+бля, блять, бляд*
+ебать, ебал*, ебан*, ебну*, ебуч*, *ебись, заеб*, наеб*, выеб*, уеб*, отъеб*, съеб*, доеб*, долбоеб*
+сука, суки, суку, сукой, сучка*, сучар*
+мудак*, мудил*, пидор*, пидар*, педик, педики, педика, гандон*, залуп*, шлюх*, шалав*, дроч*
+"""
+
 DEFAULT_SETTINGS_FILE = """; Основные настройки бота. Меняй значения после знака «=».
 ; Строки, которые начинаются с «;», — пояснения, бот их пропускает.
 ; После изменения этого файла бота нужно ПЕРЕЗАПУСТИТЬ.
@@ -95,6 +117,11 @@ DEFAULT_SETTINGS_FILE = """; Основные настройки бота. Ме�
 model = gemini-3.5-flash-lite
 ; Сколько ИИ «обдумывает» ответ: minimal (только у Flash-Lite), low, medium, high или none
 thinking_level = high
+; Запасная модель: если основная перегружена (ошибка 503) или кончился её лимит — бот спросит эту.
+; none — без запасной модели
+fallback_model = gemini-3.8-flash
+; Сколько раз повторить запрос, если Google ответил «перегружен» (503), прежде чем перейти на запасную модель
+retries = 2
 ; Сколько вопросов к ИИ может задать один человек за день
 daily_limit_per_user = 50
 ; Через сколько секунд можно задать следующий вопрос
@@ -144,6 +171,7 @@ def create_default_configs():
     os.makedirs(CONFIG_DIR, exist_ok=True)  # exist_ok=True — не ругаться, если папка уже есть
     for path, text in ((PROMPT_PATH, DEFAULT_PROMPT_FILE),
                        (AUTO_REPLIES_PATH, DEFAULT_AUTO_REPLIES_FILE),
+                       (BAD_WORDS_PATH, DEFAULT_BAD_WORDS_FILE),
                        (SETTINGS_PATH, DEFAULT_SETTINGS_FILE)):
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8") as file:
@@ -240,6 +268,31 @@ def parse_auto_replies(text):
 def auto_replies():
     """Автоответы из config/auto_replies.txt."""
     return cached_file(AUTO_REPLIES_PATH, parse_auto_replies, [])
+
+
+LETTER = "[0-9a-zа-я]"  # "буква" для поиска плохих слов (ё заранее заменяем на е)
+
+
+def parse_bad_words(text):
+    """Строки из bad_words.txt → один шаблон для поиска (или None, если слов нет).
+    Звёздочка * превращается в "любые буквы", а края слова проверяются, чтобы «сука» не ловилась в «сукно»."""
+    patterns = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for word in line.split(","):
+            word = word.strip().lower().replace("ё", "е")
+            if word.strip("*"):
+                body = f"{LETTER}*".join(re.escape(part) for part in word.split("*"))
+                # (?<!буква) и (?!буква) — до и после слова не должно быть других букв
+                patterns.append(f"(?<!{LETTER}){body}(?!{LETTER})")
+    return re.compile("|".join(patterns)) if patterns else None
+
+
+def is_rude(text):
+    """Есть ли в тексте слова из config/bad_words.txt."""
+    pattern = cached_file(BAD_WORDS_PATH, parse_bad_words, None)
+    return bool(pattern and pattern.search(text.lower().replace("ё", "е")))
 
 
 # Какие команды работают только в канале для игр (если его выбрали через /games_channel).
@@ -1608,6 +1661,10 @@ if AI_THINKING_LEVEL in ("none", "нет", "off"):
 elif AI_THINKING_LEVEL not in ("minimal", "low", "medium", "high"):
     print(f"settings.ini: thinking_level = {AI_THINKING_LEVEL} — такого уровня нет, беру high")
     AI_THINKING_LEVEL = "high"
+AI_FALLBACK_MODEL = setting("ai", "fallback_model", "gemini-3.8-flash")  # запасная модель, если основная не отвечает
+if AI_FALLBACK_MODEL.lower() in ("none", "нет", "off") or AI_FALLBACK_MODEL == AI_MODEL:
+    AI_FALLBACK_MODEL = None
+AI_RETRIES = max(0, setting("ai", "retries", 2))  # сколько раз повторить запрос при ошибке 503 "перегружен"
 AI_CONTEXT_MESSAGES = 10       # сколько последних сообщений чата показывать ИИ, чтобы он понимал разговор
 AI_COOLDOWN = setting("ai", "cooldown_seconds", 5)         # один человек может спрашивать не чаще раза в N секунд
 AI_DAILY_LIMIT = setting("ai", "daily_limit_per_user", 50)  # и не больше N вопросов в день
@@ -1647,7 +1704,14 @@ AI_TECH_RULES = """Ответ показывается в Discord, поэтом�
 Используй их естественно, когда это к месту, но не пересказывай без повода.
 Если собеседник ПРЯМО просит что-то запомнить о нём (например, «запомни, что я люблю рок»),
 допиши в самом конце ответа отдельной строкой метку [ЗАПОМНИТЬ: короткий факт о нём в третьем лице],
-например [ЗАПОМНИТЬ: любит рок]. Без прямой просьбы метку не ставь."""
+например [ЗАПОМНИТЬ: любит рок]. Без прямой просьбы метку не ставь.
+Грубость: если собеседник обращается к тебе с матом (в том числе замаскированным, например «х*й»),
+всерьёз оскорбляет тебя или других, или пишет пошлости и непотребства — не отвечай на это сообщение
+и не объясняй почему, а напиши ТОЛЬКО метку [ИГНОР]. Лёгкие шутки, «бака» и обычные вопросы о
+неприятных темах грубостью не считаются. Мат в контексте чата (не в самом вопросе к тебе) тоже не повод."""
+
+# Метка, которой ИИ сообщает "на это не отвечаю" (см. правило о грубости выше).
+IGNORE_TAG = re.compile(r"\[ИГНОР\]", re.IGNORECASE)
 
 
 def ai_system_prompt():
@@ -1805,14 +1869,57 @@ async def download_images(attachments, guild=None):
     return images
 
 
-def ai_config(system):
+def ai_config(system, model=None):
     """Настройки запроса к Gemini: инструкция, предел длины и уровень "обдумывания"."""
+    level = AI_THINKING_LEVEL
+    if level == "minimal" and "lite" not in (model or AI_MODEL):
+        level = "low"  # "minimal" есть только у Flash-Lite — для других моделей берём ближайший
     return types.GenerateContentConfig(
         system_instruction=system,
         max_output_tokens=AI_MAX_TOKENS,
         # Уровень "обдумывания": чем выше, тем умнее, но дольше
-        thinking_config=types.ThinkingConfig(thinking_level=AI_THINKING_LEVEL) if AI_THINKING_LEVEL else None,
+        thinking_config=types.ThinkingConfig(thinking_level=level) if level else None,
     )
+
+
+def is_overloaded(error):
+    """Google ответил "перегружен / временная ошибка сервера" (коды 5xx) — такое стоит просто повторить."""
+    return isinstance(error, genai_errors.ServerError) or "503" in str(error) or "UNAVAILABLE" in str(error)
+
+
+def is_quota_error(error):
+    """Google ответил "лимит запросов исчерпан" (код 429)."""
+    return "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)
+
+
+async def ai_generate(contents, system):
+    """Запрос к Gemini с повторами и запасной моделью.
+    1) Основная модель: если Google ответил 503 "перегружен" — ждём и пробуем ещё (до AI_RETRIES раз).
+    2) Не помогло (или кончился лимит основной модели) — тот же вопрос запасной модели AI_FALLBACK_MODEL.
+    Если не ответила ни одна — выбрасывает последнюю ошибку (её поймает тот, кто вызвал)."""
+    models = [AI_MODEL] + ([AI_FALLBACK_MODEL] if AI_FALLBACK_MODEL else [])
+    last_error = None
+    for model in models:
+        for attempt in range(AI_RETRIES + 1):  # первая попытка + AI_RETRIES повторов
+            try:
+                response = await ai_client.aio.models.generate_content(
+                    model=model, contents=contents, config=ai_config(system, model),
+                )
+                count_ai_request()  # Google ответил — засчитываем запрос (для /ai_limits)
+                if model != AI_MODEL:
+                    error_logger.warning("ИИ: основная модель %s не ответила (%r), ответила запасная %s",
+                                         AI_MODEL, last_error, model)
+                return response
+            except Exception as error:
+                last_error = error
+                if is_quota_error(error):
+                    ai_error_text(error)  # отмечаем для /ai_limits, что упёрлись в лимит
+                    break                 # лимит у этой модели — повторять бесполезно, сразу к запасной
+                if not is_overloaded(error):
+                    raise                 # другая ошибка (например, неверный ключ) — повтор не поможет
+                if attempt < AI_RETRIES:
+                    await asyncio.sleep(2 * (attempt + 1))  # пауза 2, потом 4 секунды — и пробуем снова
+    raise last_error
 
 
 async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
@@ -1840,13 +1947,13 @@ async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
     contents.append({"role": "user", "parts": parts})
 
     # client.aio — асинхронная версия клиента: бот не "зависает", пока ИИ думает
-    response = await ai_client.aio.models.generate_content(
-        model=AI_MODEL, contents=contents, config=ai_config(system),
-    )
-    count_ai_request()  # Google ответил — засчитываем запрос (для /ai_limits)
-    text = (response.text or "").strip()  # response.text может быть пустым, если модель отказалась отвечать
+    response = await ai_generate(contents, system)  # с повторами и запасной моделью
+    text =(response.text or "").strip()  # response.text может быть пустым, если модель отказалась отвечать
     if not text:
         return "🤔 ИИ не дал ответа. Попробуй переформулировать вопрос."
+    if IGNORE_TAG.search(text):  # ИИ решил, что к нему обратились грубо, — не отвечаем и не запоминаем
+        error_logger.info("ИИ промолчала на грубость: пользователь=%s канал=%s", user.id, channel_id)
+        return None
 
     # Ищем метки [ЗАПОМНИТЬ: ...], сохраняем факты и убираем метки из текста
     notes = []
@@ -1873,9 +1980,11 @@ async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
 def ai_error_text(error):
     """Понятный текст ошибки ИИ для чата."""
     global ai_last_quota_error  # global — меняем переменную, объявленную вне функции
-    if "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error):  # так Google сообщает о превышении лимитов
+    if is_quota_error(error):  # так Google сообщает о превышении лимитов
         ai_last_quota_error = time.time()  # запоминаем, когда это случилось (покажем в /ai_limits)
         return "😵 Лимит бесплатных запросов к ИИ на сейчас исчерпан. Попробуй позже (подробнее — /ai_limits)."
+    if is_overloaded(error):  # 503 — у Google сейчас слишком много запросов, это временно
+        return "😵 ИИ у Google сейчас перегружен, попробуй через пару минут."
     return "😵 ИИ сейчас недоступен, попробуй чуть позже."
 
 
@@ -1924,6 +2033,9 @@ async def chat_context(channel, before_message):
 
 async def ai_reply(message):
     """Отвечает с помощью ИИ на сообщение, в котором обратились к боту."""
+    if is_rude(message.content):  # к боту обратились с матом — молчим (и не тратим запрос к Google)
+        error_logger.info("Бот промолчала на мат: пользователь=%s канал=%s", message.author.id, message.channel.id)
+        return
     refusal = ai_limit_check(message.author.id)
     if refusal:
         await message.reply(refusal, mention_author=False)
@@ -1952,6 +2064,8 @@ async def ai_reply(message):
             await report_error("ИИ (ответ на сообщение)", error, message.guild, message.author, message.channel)
             answer = ai_error_text(error)
 
+    if answer is None:  # ИИ сама решила, что обращение грубое, — просто не отвечаем
+        return
     parts = split_message(answer)
     await message.reply(parts[0], mention_author=False, allowed_mentions=NO_PINGS)
     for part in parts[1:]:  # если ответ длинный — остальные части отдельными сообщениями
@@ -2261,12 +2375,9 @@ async def make_daily_text(kind, guild=None):
                 f"Потом пожелай всем удачного завтрашнего дня и спокойной ночи. Всего 3–6 предложений.")
     if ai_client:
         try:
-            response = await ai_client.aio.models.generate_content(
-                model=AI_MODEL, contents=task,
-                config=ai_config(ai_system_prompt() + f"\nСегодня {today:%d.%m.%Y}."),
-            )
-            count_ai_request()
-            text = REMEMBER_TAG.sub("", response.text or "").strip()  # на всякий случай убираем метки памяти
+            response = await ai_generate(task, ai_system_prompt() + f"\nСегодня {today:%d.%m.%Y}.")
+            text = REMEMBER_TAG.sub("", response.text or "")  # на всякий случай убираем метки памяти...
+            text = IGNORE_TAG.sub("", text).strip()            # ...и метку "не отвечаю"
             if text:
                 return text
         except Exception as error:
@@ -2612,6 +2723,14 @@ async def ask(interaction: discord.Interaction, question: str, image: discord.At
         await interaction.response.send_message(
             f"Это не подходит: нужна картинка PNG, JPEG или WEBP не больше {AI_MAX_IMAGE_MB} МБ.", ephemeral=True)
         return
+    if is_rude(question):  # вопрос с матом — молчим
+        error_logger.info("Бот промолчала на мат в /ask: пользователь=%s канал=%s",
+                          interaction.user.id, interaction.channel_id)
+        # На слэш-команду Discord требует ответ, иначе покажет «приложение не отвечает». Поэтому отвечаем
+        # невидимо: "думаю..." видно только автору, и мы сразу его удаляем — получается просто тишина.
+        await interaction.response.defer(ephemeral=True)
+        await interaction.delete_original_response()
+        return
     refusal = ai_limit_check(interaction.user.id)
     if refusal:
         await interaction.response.send_message(refusal, ephemeral=True)
@@ -2626,6 +2745,9 @@ async def ask(interaction: discord.Interaction, question: str, image: discord.At
         await report_error("ИИ /ask", error, interaction.guild, interaction.user, interaction.channel)
         answer = ai_error_text(error)
 
+    if answer is None:  # ИИ решила, что вопрос грубый, — убираем "бот думает..." и молчим
+        await interaction.delete_original_response()
+        return
     parts = split_message(f"❓ {question}\n\n{answer}")  # сначала вопрос, потом ответ
     if image:  # показываем картинку, о которой спрашивали, в "карточке" под первым сообщением
         embed = discord.Embed(color=0x8B5CF6).set_image(url=image.url)
