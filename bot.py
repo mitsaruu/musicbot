@@ -6,7 +6,7 @@
 #  Разное:  /weather, /weather_cities, /dice, /roll, /divination, /pogonyalo
 #  Игра:    /dick_growth, /dick_size, /dick_leaderboard
 #  Деньги:  /work, /balance, /give_money, /money_leaderboard, /coinflip, /slots, /blackjack
-#  Питомцы: /case, /cases, /pets, /pets_collect, /pet_feed, /pet_sell — питомцы из кейсов приносят монеты
+#  Питомцы: /case (дешёвый, средний, дорогой), /cases, /pets, /pets_collect, /pet_feed, /pet_sell — питомцы из кейсов приносят монеты
 #  Каждый день: /daily_setup, /daily_off, /daily_test — утренние и вечерние сообщения с фактами
 #  Иногда: раз в 20 минут с шансом 5% бот сам пишет реплику по теме чата (settings.ini, [chatter])
 #  Каналы:  /games_channel — ранги, рейтинги и игры работают только в выбранном канале
@@ -167,9 +167,10 @@ min_bet = 10
 
 [pets]
 ; Питомцы из кейсов (/case): каждый сам приносит монеты в час, их забирают командой /pets_collect.
-; Цена обычного и золотого кейса (в золотом нет обычных питомцев)
-case_price = 1000
-gold_case_price = 5000
+; Цены кейсов: дешёвый, средний и дорогой (в дорогом нет обычных питомцев, шансы — в /cases)
+cheap_case_price = 500
+medium_case_price = 2000
+expensive_case_price = 7500
 ; Сколько питомцев может быть у одного человека и до какого уровня их можно вырастить (/pet_feed)
 max_pets = 10
 max_level = 20
@@ -3771,37 +3772,44 @@ async def blackjack(interaction: discord.Interaction, bet: app_commands.Range[in
 #  Ненужного питомца можно продать (/pet_sell) — вернётся часть вложенных монет.
 # ============================================================
 
-CASE_PRICE = max(1, setting("pets", "case_price", 1000))             # обычный кейс
-GOLD_CASE_PRICE = max(1, setting("pets", "gold_case_price", 5000))   # золотой кейс — без обычных питомцев
 MAX_PETS = max(1, setting("pets", "max_pets", 10))                   # сколько питомцев может быть у одного человека
 PET_MAX_LEVEL = max(1, setting("pets", "max_level", 20))
 PET_COLLECT_CAP = max(1, setting("pets", "collect_cap_hours", 24))  # доход копится не дольше N часов
 PET_SELL_PERCENT = min(max(setting("pets", "sell_percent", 50), 0), 100)  # сколько % вложенного вернёт продажа
 
-# Редкость: название, цвет карточки и шансы в обычном и золотом кейсе (в процентах).
-PET_RARITIES = {
-    "common":    {"name": "Обычный",     "color": 0x9CA3AF, "case": 60.0, "gold": 0.0},
-    "rare":      {"name": "Редкий",      "color": 0x3B82F6, "case": 28.0, "gold": 50.0},
-    "epic":      {"name": "Эпический",   "color": 0xA855F7, "case": 9.0,  "gold": 35.0},
-    "legendary": {"name": "Легендарный", "color": 0xF59E0B, "case": 2.7,  "gold": 12.0},
-    "mythic":    {"name": "Мифический",  "color": 0xEF4444, "case": 0.3,  "gold": 3.0},
+# Кейсы: ключ → значок, название и цена (цены — из settings.ini, раздел [pets])
+PET_CASES = {
+    "cheap":     {"emoji": "📦", "name": "Дешёвый", "price": max(1, setting("pets", "cheap_case_price", 500))},
+    "medium":    {"emoji": "🎁", "name": "Средний", "price": max(1, setting("pets", "medium_case_price", 2000))},
+    "expensive": {"emoji": "💎", "name": "Дорогой", "price": max(1, setting("pets", "expensive_case_price", 7500))},
 }
 
-# Виды питомцев: ключ → (эмодзи, имя, редкость, монет в час на 1 уровне)
+# Редкость: название, цвет карточки и шанс выпасть в каждом кейсе (в процентах, в каждом кейсе сумма — 100).
+PET_RARITIES = {
+    "common":    {"name": "Обычный",     "color": 0x9CA3AF, "cheap": 75.0, "medium": 40.0, "expensive": 0.0},
+    "rare":      {"name": "Редкий",      "color": 0x3B82F6, "cheap": 20.0, "medium": 38.0, "expensive": 40.0},
+    "epic":      {"name": "Эпический",   "color": 0xA855F7, "cheap": 4.5,  "medium": 17.0, "expensive": 40.0},
+    "legendary": {"name": "Легендарный", "color": 0xF59E0B, "cheap": 0.49, "medium": 4.8,  "expensive": 18.5},
+    "mythic":    {"name": "Мифический",  "color": 0xEF4444, "cheap": 0.01, "medium": 0.2,  "expensive": 1.5},
+}
+
+# Виды питомцев: ключ → (эмодзи, название, редкость, монет в час на 1 уровне).
+# Имя есть только у самого редкого — собаки Сергея.
 PET_SPECIES = {
-    "sergey":   ("🐶", "собачка Сергей",      "common",    10),
-    "valera":   ("🐱", "котик Валера",        "common",    10),
-    "gena":     ("🐹", "хомяк Геннадий",      "common",    12),
-    "tolik":    ("🐦", "голубь Толик",        "common",    8),
-    "arkady":   ("🦊", "лис Аркадий",         "rare",      25),
-    "tamara":   ("🦉", "сова Тамара",         "rare",      25),
-    "boris":    ("🐢", "черепаха Борис",      "rare",      22),
-    "igor":     ("🐺", "волк Игорь",          "epic",      60),
-    "edik":     ("🐧", "пингвин Эдуард",      "epic",      55),
-    "zhorik":   ("🦝", "енот Жорик",          "epic",      65),
-    "vasily":   ("🐉", "дракон Василий",      "legendary", 150),
-    "lyudmila": ("🦄", "единорог Людмила",    "legendary", 140),
-    "schrod":   ("🐈‍⬛", "кот Шрёдингера",      "mythic",    400),
+    "valera":   ("🐱", "котик",         "common",    10),
+    "gena":     ("🐹", "хомяк",         "common",    12),
+    "tolik":    ("🐦", "голубь",        "common",    8),
+    "frog":     ("🐸", "лягушка",       "common",    9),
+    "arkady":   ("🦊", "лисичка",       "rare",      25),
+    "tamara":   ("🦉", "сова",          "rare",      25),
+    "boris":    ("🐢", "черепаха",      "rare",      22),
+    "igor":     ("🐺", "волк",          "epic",      60),
+    "edik":     ("🐧", "пингвин",       "epic",      55),
+    "zhorik":   ("🦝", "енот",          "epic",      65),
+    "vasily":   ("🐉", "дракон",        "legendary", 150),
+    "lyudmila": ("🦄", "единорог",      "legendary", 140),
+    "lion":     ("🦁", "лев",           "legendary", 160),
+    "sergey":   ("🐶", "собака Сергей", "mythic",    500),
 }
 
 PET_STAGES = [(1, "малыш"), (5, "подросток"), (10, "взрослый"), (15, "легенда района")]  # с какого уровня какая стадия
@@ -3839,8 +3847,9 @@ def pet_pending(species, level, last_collect, now=None):
 
 def user_pets(guild_id, user_id):
     """Питомцы человека по порядку: список (id, species, level, last_collect, spent)."""
-    return db.execute("SELECT id, species, level, last_collect, spent FROM pets "
+    rows = db.execute("SELECT id, species, level, last_collect, spent FROM pets "
                       "WHERE guild_id = ? AND user_id = ? ORDER BY id", (guild_id, user_id)).fetchall()
+    return [row for row in rows if row[1] in PET_SPECIES]  # вид, которого больше нет в списке, пропускаем
 
 
 def roll_pet(case_kind):
@@ -3862,20 +3871,21 @@ async def pet_autocomplete(interaction: discord.Interaction, current: str):
 
 def own_pet(interaction, pet_id):
     """Питомец по id, только если он принадлежит вызвавшему. (id, species, level, last_collect, spent) или None."""
-    return db.execute("SELECT id, species, level, last_collect, spent FROM pets "
-                      "WHERE id = ? AND guild_id = ? AND user_id = ?",
-                      (pet_id, interaction.guild_id, interaction.user.id)).fetchone()
+    row = db.execute("SELECT id, species, level, last_collect, spent FROM pets "
+                     "WHERE id = ? AND guild_id = ? AND user_id = ?",
+                     (pet_id, interaction.guild_id, interaction.user.id)).fetchone()
+    return row if row and row[1] in PET_SPECIES else None
 
 
-@bot.tree.command(name="case", description=f"Открыть кейс с питомцем (обычный — {CASE_PRICE}, золотой — {GOLD_CASE_PRICE} монет)")
+@bot.tree.command(name="case", description="Открыть кейс с питомцем: дешёвый, средний или дорогой")
 @app_commands.describe(kind="Какой кейс открыть")
 @app_commands.choices(kind=[
-    app_commands.Choice(name=f"📦 Обычный — {CASE_PRICE} монет", value="case"),
-    app_commands.Choice(name=f"🎁 Золотой — {GOLD_CASE_PRICE} монет (без обычных питомцев)", value="gold"),
+    app_commands.Choice(name=f"{case['emoji']} {case['name']} — {money_text(case['price'])}", value=key)
+    for key, case in PET_CASES.items()
 ])
 @app_commands.guild_only()
 async def open_case(interaction: discord.Interaction, kind: app_commands.Choice[str]):
-    price = CASE_PRICE if kind.value == "case" else GOLD_CASE_PRICE
+    price = PET_CASES[kind.value]["price"]
     if len(user_pets(interaction.guild_id, interaction.user.id)) >= MAX_PETS:
         await interaction.response.send_message(
             f"🏠 У тебя уже {MAX_PETS} питомцев — больше не поместится. Продай кого-нибудь: /pet_sell", ephemeral=True)
@@ -3889,13 +3899,15 @@ async def open_case(interaction: discord.Interaction, kind: app_commands.Choice[
                (interaction.guild_id, interaction.user.id, species, time.time(), price))
     db.commit()
 
-    box = "📦" if kind.value == "case" else "🎁"
-    await interaction.response.send_message(f"{box} {interaction.user.mention} открывает кейс...",
+    case = PET_CASES[kind.value]
+    await interaction.response.send_message(
+        f"{case['emoji']} {interaction.user.mention} открывает {case['name'].lower()} кейс...",
                                             allowed_mentions=NO_PINGS)
     await asyncio.sleep(2)  # немного интриги
     info = PET_RARITIES[rarity]
     embed = discord.Embed(color=info["color"], title=f"{emoji} {name}",
-                          description=f"**{info['name']}** питомец!\nПриносит **{money_text(pet_income(species, 1))} в час**.")
+                          description=f"**{info['name']}** питомец{'!!! Самый редкий в игре!' if rarity == 'mythic' else '!'}\n"
+                                      f"Приносит **{money_text(pet_income(species, 1))} в час**.")
     embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
     embed.set_footer(text="Забрать доход — /pets_collect · вырастить — /pet_feed")
     await interaction.edit_original_response(content=None, embed=embed)
@@ -3903,13 +3915,13 @@ async def open_case(interaction: discord.Interaction, kind: app_commands.Choice[
 
 @bot.tree.command(name="cases", description="Какие питомцы бывают в кейсах и с каким шансом")
 async def show_cases(interaction: discord.Interaction):
-    lines = []
+    lines = [" · ".join(f"{c['emoji']} **{c['name']}** — {money_text(c['price'])}" for c in PET_CASES.values())]
     for rarity, info in PET_RARITIES.items():
         pets = ", ".join(f"{e} {n} ({money_text(income)}/ч)" for e, n, r, income in PET_SPECIES.values() if r == rarity)
-        lines.append(f"**{info['name']}** — обычный кейс {info['case']:g}%, золотой {info['gold']:g}%\n{pets}")
+        odds = " · ".join(f"{c['emoji']} {info[key]:g}%" for key, c in PET_CASES.items())
+        lines.append(f"**{info['name']}** — {odds}\n{pets}")
     embed = discord.Embed(color=0x8B5CF6, title="🎁 Кейсы с питомцами", description="\n\n".join(lines))
-    embed.set_footer(text=f"Обычный кейс — {CASE_PRICE}, золотой — {GOLD_CASE_PRICE} монет. "
-                          f"Каждый уровень питомца: +25% к доходу.")
+    embed.set_footer(text="Каждый уровень питомца: +25% к доходу.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -3983,8 +3995,8 @@ async def pet_feed(interaction: discord.Interaction, pet: int):
     db.commit()
     stage_up = pet_stage(level + 1) != pet_stage(level)
     await interaction.response.send_message(
-        f"🍖 {interaction.user.mention} кормит {pet_title(species)} за {money_text(cost)} — "
-        f"теперь **ур. {level + 1}**{' и он стал **' + pet_stage(level + 1) + '**!' if stage_up else ''}. "
+        f"🍖 Питомец {interaction.user.mention} {pet_title(species)} поел за {money_text(cost)} — "
+        f"теперь **ур. {level + 1}**{' и теперь он **' + pet_stage(level + 1) + '**!' if stage_up else ''}. "
         f"Доход: **{money_text(new_income)}/ч**"
         + (f", следующая кормёжка — {money_text(pet_feed_cost(species, level + 1))}." if level + 1 < PET_MAX_LEVEL else "."),
         allowed_mentions=NO_PINGS)
@@ -4004,7 +4016,7 @@ async def pet_sell(interaction: discord.Interaction, pet: int):
     db.execute("DELETE FROM pets WHERE id = ?", (pet_id,))
     balance = add_money(interaction.guild_id, interaction.user, price)
     await interaction.response.send_message(
-        f"💸 {interaction.user.mention} продаёт {pet_title(species, level)} за **{money_text(price)}**. "
+        f"💸 {interaction.user.mention} продаёт питомца {pet_title(species, level)} за **{money_text(price)}**. "
         f"Баланс: **{money_text(balance)}**.", allowed_mentions=NO_PINGS)
 
 
