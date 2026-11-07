@@ -22,6 +22,7 @@
 import asyncio   # стандартная библиотека Python для асинхронного кода (бот делает много дел "одновременно")
 import datetime  # даты: какой сегодня день и месяц (для погоняла на день и топа треков за месяц)
 import io        # "файлы в памяти": картинку не сохраняем на диск, а сразу отправляем в Discord
+import json      # разбор данных в формате JSON (например, списка треков со страницы плеера Spotify)
 import os        # нужна, чтобы прочитать токен бота из переменной окружения
 import random    # случайные числа (сколько опыта дать за сообщение)
 import re        # "регулярные выражения" — поиск шаблонов в тексте (ссылки Spotify, слова для автоответов)
@@ -371,6 +372,8 @@ SPOTIFY_LINK = re.compile(r"open\.spotify\.com/(?:intl-[a-z]+/)?(track|album|pla
 
 # Сколько треков максимум брать из одного альбома (каждый ищется на YouTube, это небыстро).
 MAX_ALBUM_TRACKS = 20
+# И из одного плейлиста. Треки ищутся на YouTube по одному, перед включением, так что длинный плейлист не тормозит.
+MAX_PLAYLIST_TRACKS = 100
 
 # Настройки для yt-dlp:
 YDL_OPTIONS = {
@@ -578,12 +581,44 @@ async def spotify_lookup(kind, spotify_id):
     return await loop.run_in_executor(None, fetch)
 
 
-async def add_album(interaction, queries, album_name):
-    """Добавляет все треки альбома в очередь. Искать их на YouTube бот будет по одному, перед включением."""
+SPOTIFY_EMBED_DATA = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', re.S)
+
+
+async def spotify_embed_lookup(kind, spotify_id):
+    """То же, что spotify_lookup, но без ключей API — через публичную страницу плеера Spotify (embed).
+    Так работают и плейлисты: Spotify API чужие плейлисты больше не отдаёт, а плеер на сайтах — отдаёт.
+    Возвращает (список строк "Исполнитель - Название", название) или выбрасывает ошибку."""
+    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"User-Agent": "Mozilla/5.0"}  # без этого Spotify может отдать пустую страницу
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(f"https://open.spotify.com/embed/{kind}/{spotify_id}") as response:
+            response.raise_for_status()
+            html = await response.text()
+    match = SPOTIFY_EMBED_DATA.search(html)  # данные плеера лежат на странице в виде JSON
+    if not match:
+        raise ValueError("на странице Spotify нет данных плеера")
+    entity =json.loads(match.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+    name = entity.get("name") or entity.get("title") or "Spotify"
+    if kind == "track":
+        artist = entity.get("subtitle") or ", ".join(a.get("name", "") for a in entity.get("artists", []))
+        return [f"{artist} - {name}".strip(" -")], name
+    limit = MAX_PLAYLIST_TRACKS if kind == "playlist" else MAX_ALBUM_TRACKS
+    tracks = [t for t in entity.get("trackList", []) if t.get("isPlayable", True)][:limit]
+    # \xa0 — "неразрывный пробел", которым Spotify разделяет исполнителей; меняем на обычный
+    queries = [f"{t.get('subtitle', '')} - {t.get('title', '')}".replace("\xa0", " ").strip(" -")
+               for t in tracks if t.get("title")]
+    if not queries:
+        raise ValueError("в плейлисте/альбоме нет доступных треков")
+    return queries, name
+
+
+async def add_album(interaction, queries, album_name, kind="album"):
+    """Добавляет все треки альбома или плейлиста в очередь. Искать их на YouTube бот будет по одному, перед включением."""
     for query in queries:
         # "ytsearch1:" — явно говорим yt-dlp "найди на YouTube первый результат по этому тексту"
         queue_add(interaction.guild.id, f"ytsearch1:{query}", query)
-    await interaction.followup.send(f"💿 Альбом **{album_name}**: добавил в очередь треков — {len(queries)}.")
+    label = "📜 Плейлист" if kind == "playlist" else "💿 Альбом"
+    await interaction.followup.send(f"{label} **{album_name}**: добавил в очередь треков — {len(queries)}.")
     await play_next(interaction.guild, interaction.channel)  # если ничего не играет — начнём
 
 
@@ -2631,23 +2666,27 @@ async def play(interaction: discord.Interaction, query: str):
     if match:
         kind, spotify_id = match.groups()  # kind = "track" / "album" / "playlist", spotify_id = id из ссылки
 
-        if spotify is None:  # ключи Spotify не заданы
-            await interaction.followup.send("Spotify не настроен: нет SPOTIFY_CLIENT_ID и SPOTIFY_CLIENT_SECRET.")
-            return
+        queries = None
+        # Треки и альбомы — через Spotify API, если ключи заданы. Плейлисты API чужим приложениям не отдаёт,
+        # поэтому их (и всё остальное, если ключей нет или API не ответил) берём со страницы плеера Spotify.
+        if spotify is not None and kind != "playlist":
+            try:
+                queries, name = await spotify_lookup(kind, spotify_id)  # узнаём названия песен
+            except Exception as error:
+                await report_error("Spotify API /play", error, interaction.guild, interaction.user,
+                                   interaction.channel)
+        if queries is None:
+            try:
+                queries, name = await spotify_embed_lookup(kind, spotify_id)
+            except Exception as error:
+                await report_error("Spotify (страница плеера) /play", error, interaction.guild, interaction.user,
+                                   interaction.channel)
+                what = "плейлист приватный или удалён" if kind == "playlist" else "ссылка неправильная или трек удалён"
+                await interaction.followup.send(f"Не получилось получить данные из Spotify: возможно, {what}.")
+                return
 
-        if kind == "playlist":  # плейлисты Spotify с 2026 года отдаёт только их владельцу
-            await interaction.followup.send("Плейлисты Spotify пока не поддерживаются — можно ссылки на треки и альбомы.")
-            return
-
-        try:
-            queries, name = await spotify_lookup(kind, spotify_id)  # узнаём названия песен
-        except Exception as error:
-            await report_error("Spotify /play", error, interaction.guild, interaction.user, interaction.channel)
-            await interaction.followup.send("Не получилось получить данные из Spotify.")
-            return
-
-        if kind == "album":
-            await add_album(interaction, queries, name)  # у альбома отдельная обработка
+        if kind in ("album", "playlist"):
+            await add_album(interaction, queries, name, kind)  # у альбома и плейлиста отдельная обработка
             return
 
         # Для одного трека дальше ищем "Исполнитель - Название" на YouTube, как обычный текст.
