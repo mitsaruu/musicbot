@@ -13,7 +13,8 @@
 #           память: /remember, /memory, /forget (бот помнит разговор и факты о людях)
 #           картинки: бот видит изображения в сообщении и в том, на которое ответили
 #  Автоответы на слова «привет» и «даня»
-#  Грубость: на мат и непотребства ИИ не отвечает (слова — в config/bad_words.txt, остальное решает сам ИИ)
+#  Грубость: на мат и непотребства ИИ не отвечает (слова — в config/bad_words.txt, остальное решает сам ИИ),
+#           со второго раза подряд — тайм-аут: 1, 5, 10, 30, 60 минут (settings.ini, раздел [moderation])
 #  Настройки: папка config — prompt.txt (характер ИИ), auto_replies.txt (автоответы),
 #             bad_words.txt (слова, на которые бот молчит), settings.ini (числа)
 # ============================================================
@@ -163,6 +164,16 @@ growth_cooldown_hours = 24
 ; Команды, которые работают только в канале для игр (его выбирают в Discord командой /games_channel).
 ; Пиши названия через запятую. Пока канал не выбран, все команды работают везде.
 games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, dice, roll, divination, pogonyalo
+
+[moderation]
+; Тайм-ауты за грубость к боту (мат, оскорбления, непотребства). Первый раз бот просто молчит,
+; со второго раза подряд — тайм-аут. Длительности в минутах по порядку: 2-й раз, 3-й, 4-й...
+; Дальше каждый раз — последняя из списка. off — не давать тайм-аутов (бот будет только молчать).
+timeouts = 1, 5, 10, 30, 60
+; Через сколько минут без грубостей счётчик обнуляется (вежливое сообщение боту тоже обнуляет его)
+strike_reset_minutes = 60
+; Писать ли в чат, что человек получил тайм-аут: on или off
+announce_timeouts = on
 """
 
 
@@ -733,6 +744,17 @@ db.execute("""
     CREATE TABLE IF NOT EXISTS games_channel (
         guild_id   INTEGER PRIMARY KEY,
         channel_id INTEGER
+    )
+""")
+
+# Счётчик грубостей к боту подряд — для тайм-аутов (раздел [moderation] в settings.ini).
+db.execute("""
+    CREATE TABLE IF NOT EXISTS rude_strikes (
+        guild_id  INTEGER,
+        user_id   INTEGER,
+        count     INTEGER,   -- сколько раз подряд человек грубил боту
+        last_time REAL,      -- когда последний раз (чтобы со временем обнулять)
+        PRIMARY KEY (guild_id, user_id)
     )
 """)
 
@@ -2031,10 +2053,115 @@ async def chat_context(channel, before_message):
     return "\n".join(lines)
 
 
+# ============================================================
+#  ТАЙМ-АУТЫ ЗА ГРУБОСТЬ
+#  Первый раз бот просто молчит. Если человек грубит боту второй раз подряд — тайм-аут на 1 минуту,
+#  третий — на 5, четвёртый — на 10 и так далее (список — в settings.ini, раздел [moderation]).
+#  Счётчик обнуляется, если человек нормально обратился к боту или долго (strike_reset_minutes) не грубил.
+#  Боту нужно право «Отправлять участников подумать» (Moderate Members), а его роль должна быть
+#  выше роли нарушителя. Владельцу сервера и администраторам тайм-аут дать нельзя — это ограничение Discord.
+# ============================================================
+
+def parse_timeouts(text):
+    """«1, 5, 10, 30, 60» → [1, 5, 10, 30, 60] (минуты). off / пусто → [] (тайм-аутов нет)."""
+    if text.strip().lower() in ("off", "none", "нет", "0", ""):
+        return []
+    try:
+        minutes = [int(part) for part in text.split(",") if part.strip()]
+    except ValueError:
+        print(f"settings.ini: timeouts = {text} — нужны числа через запятую, беру 1, 5, 10, 30, 60")
+        return [1, 5, 10, 30, 60]
+    return [min(max(m, 1), 28 * 24 * 60) for m in minutes]  # Discord разрешает тайм-аут от 1 минуты до 28 дней
+
+
+TIMEOUT_STEPS = parse_timeouts(setting("moderation", "timeouts", "1, 5, 10, 30, 60"))
+STRIKE_RESET_MINUTES = setting("moderation", "strike_reset_minutes", 60)
+ANNOUNCE_TIMEOUTS = setting("moderation", "announce_timeouts", "on").lower() not in ("off", "нет", "no", "0")
+
+
+def minutes_text(minutes):
+    """Минуты → текст вроде «1 минуту», «5 минут», «2 часа»."""
+    if minutes % (24 * 60) == 0:
+        days = minutes // (24 * 60)
+        return f"{days} {plural(days, 'день', 'дня', 'дней')}"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} {plural(hours, 'час', 'часа', 'часов')}"
+    return f"{minutes} {plural(minutes, 'минуту', 'минуты', 'минут')}"
+
+
+def add_strike(guild_id, user_id):
+    """+1 к счётчику грубостей подряд. Возвращает новое значение."""
+    now = time.time()
+    row = db.execute("SELECT count, last_time FROM rude_strikes WHERE guild_id = ? AND user_id = ?",
+                     (guild_id, user_id)).fetchone()
+    count = row[0] if row and now - row[1] < STRIKE_RESET_MINUTES * 60 else 0  # давно не грубил — с нуля
+    count += 1
+    db.execute("""
+        INSERT INTO rude_strikes (guild_id, user_id, count, last_time) VALUES (?, ?, ?, ?)
+        ON CONFLICT (guild_id, user_id) DO UPDATE SET count = excluded.count, last_time = excluded.last_time
+    """, (guild_id, user_id, count, now))
+    db.commit()
+    return count
+
+
+def reset_strikes(guild_id, user_id):
+    """Человек нормально обратился к боту — грубости больше не "подряд"."""
+    if guild_id:
+        db.execute("DELETE FROM rude_strikes WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        db.commit()
+
+
+async def punish_rudeness(member, channel):
+    """Засчитывает грубость и, начиная со второй подряд, даёт тайм-аут."""
+    guild = getattr(member, "guild", None)
+    if guild is None or not isinstance(member, discord.Member):  # в личных сообщениях тайм-аутов нет
+        return
+    count = add_strike(guild.id, member.id)
+    error_logger.info("Грубость к боту: пользователь=%s сервер=%s подряд=%s", member.id, guild.id, count)
+    if count < 2 or not TIMEOUT_STEPS:  # первый раз — только молчим
+        return
+
+    minutes = TIMEOUT_STEPS[min(count - 2, len(TIMEOUT_STEPS) - 1)]  # 2-й раз — первая длительность и т.д.
+    try:
+        await member.timeout(datetime.timedelta(minutes=minutes), reason=f"Грубость к боту ({count} раз подряд)")
+    except discord.Forbidden:
+        # Нет права Moderate Members, роль бота ниже или это администратор/владелец — пишем только в логи
+        error_logger.warning("Не получилось дать тайм-аут %s: не хватает прав", member.id)
+        log_channel = log_channel_for(guild.id)
+        if log_channel:
+            try:
+                await log_channel.send(
+                    f"⚠️ Хотела дать тайм-аут {member.mention} за грубость ({count} раз подряд), но не хватает прав: "
+                    f"нужно право «Отправлять участников подумать» (Moderate Members), и моя роль должна быть выше его роли.",
+                    allowed_mentions=NO_PINGS)
+            except Exception:
+                pass
+        return
+    except Exception as error:
+        await report_error("Тайм-аут за грубость", error, guild, member, channel)
+        return
+
+    text = f"🔇 {member.mention} отдохнёт {minutes_text(minutes)}. Хватит грубить."
+    if ANNOUNCE_TIMEOUTS and channel is not None:
+        try:
+            await channel.send(text, allowed_mentions=NO_PINGS)  # без пинга
+        except Exception:
+            pass
+    log_channel = log_channel_for(guild.id)
+    if log_channel and log_channel != channel:
+        try:
+            await log_channel.send(f"{text} ({count} раз подряд, в {channel.mention if channel else '?'})",
+                                   allowed_mentions=NO_PINGS)
+        except Exception:
+            pass
+
+
 async def ai_reply(message):
     """Отвечает с помощью ИИ на сообщение, в котором обратились к боту."""
     if is_rude(message.content):  # к боту обратились с матом — молчим (и не тратим запрос к Google)
         error_logger.info("Бот промолчала на мат: пользователь=%s канал=%s", message.author.id, message.channel.id)
+        await punish_rudeness(message.author, message.channel)
         return
     refusal = ai_limit_check(message.author.id)
     if refusal:
@@ -2064,8 +2191,10 @@ async def ai_reply(message):
             await report_error("ИИ (ответ на сообщение)", error, message.guild, message.author, message.channel)
             answer = ai_error_text(error)
 
-    if answer is None:  # ИИ сама решила, что обращение грубое, — просто не отвечаем
+    if answer is None:  # ИИ сама решила, что обращение грубое, — не отвечаем
+        await punish_rudeness(message.author, message.channel)
         return
+    reset_strikes(message.guild.id, message.author.id)  # нормальное обращение — счётчик грубостей с нуля
     parts = split_message(answer)
     await message.reply(parts[0], mention_author=False, allowed_mentions=NO_PINGS)
     for part in parts[1:]:  # если ответ длинный — остальные части отдельными сообщениями
@@ -2730,6 +2859,7 @@ async def ask(interaction: discord.Interaction, question: str, image: discord.At
         # невидимо: "думаю..." видно только автору, и мы сразу его удаляем — получается просто тишина.
         await interaction.response.defer(ephemeral=True)
         await interaction.delete_original_response()
+        await punish_rudeness(interaction.user, interaction.channel)
         return
     refusal = ai_limit_check(interaction.user.id)
     if refusal:
@@ -2747,8 +2877,10 @@ async def ask(interaction: discord.Interaction, question: str, image: discord.At
 
     if answer is None:  # ИИ решила, что вопрос грубый, — убираем "бот думает..." и молчим
         await interaction.delete_original_response()
+        await punish_rudeness(interaction.user, interaction.channel)
         return
-    parts = split_message(f"❓ {question}\n\n{answer}")  # сначала вопрос, потом ответ
+    reset_strikes(interaction.guild_id, interaction.user.id)  # нормальный вопрос — счётчик грубостей с нуля
+    parts =split_message(f"❓ {question}\n\n{answer}")  # сначала вопрос, потом ответ
     if image:  # показываем картинку, о которой спрашивали, в "карточке" под первым сообщением
         embed = discord.Embed(color=0x8B5CF6).set_image(url=image.url)
         await interaction.followup.send(parts[0], embed=embed, allowed_mentions=NO_PINGS)
