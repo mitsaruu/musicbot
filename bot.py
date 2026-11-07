@@ -7,6 +7,7 @@
 #  Игра:    /dick_growth, /dick_size, /dick_leaderboard
 #  Деньги:  /work, /balance, /give_money, /money_leaderboard, /coinflip, /slots, /blackjack
 #  Каждый день: /daily_setup, /daily_off, /daily_test — утренние и вечерние сообщения с фактами
+#  Иногда: раз в 20 минут с шансом 5% бот сам пишет реплику по теме чата (settings.ini, [chatter])
 #  Каналы:  /games_channel — ранги, рейтинги и игры работают только в выбранном канале
 #           /log_channel — куда бот присылает свои ошибки (а ещё они всегда пишутся в bot.log)
 #  ИИ:      характер тсундере; /ask, /ai_limits, а также ответ, если упомянуть бота (@бот) или ответить ему
@@ -178,6 +179,12 @@ timeouts = 1, 5, 10, 30, 60
 strike_reset_minutes = 60
 ; Писать ли в чат, что человек получил тайм-аут: on или off
 announce_timeouts = on
+
+[chatter]
+; Иногда бот сам пишет в чат короткую реплику по теме разговора (в канал, где недавно общались).
+; Раз в interval_minutes минут — с шансом chance_percent процентов. 0 — выключить.
+chance_percent = 5
+interval_minutes = 20
 """
 
 
@@ -2631,11 +2638,80 @@ async def before_daily_loop():
     await bot.wait_until_ready()
 
 
+# ============================================================
+#  СЛУЧАЙНЫЕ РЕПЛИКИ: раз в interval_minutes бот с шансом chance_percent сам пишет
+#  что-нибудь по теме разговора — в тот канал сервера, где недавно общались люди.
+#  Настройки — settings.ini, раздел [chatter]. chance_percent = 0 — выключить.
+# ============================================================
+CHATTER_CHANCE = min(max(setting("chatter", "chance_percent", 5), 0), 100)  # шанс в процентах
+CHATTER_INTERVAL = max(setting("chatter", "interval_minutes", 20), 1)        # как часто бросать "кубик"
+CHATTER_HISTORY = 15  # сколько последних сообщений канала показывать ИИ, чтобы понять тему
+
+# Где на каждом сервере последний раз писали люди: id сервера → (id канала, время). Заполняет on_message.
+last_activity = {}
+
+CHATTER_TASK = """Ниже последние сообщения из чата Discord. Ты — участник этого чата, тебя никто не звал.
+Вставь от себя ОДНУ короткую реплику в тему разговора: шутку, мнение, вопрос или интересный факт по теме.
+Не здоровайся, не говори, что тебя не звали, не пересказывай чат и не упоминай, что ты бот.
+Если тема неприличная, грубая или сказать нечего — напиши только [ИГНОР].
+
+{chat}"""
+
+
+async def chatter_text(channel):
+    """Придумывает реплику по теме последних сообщений канала. None — если писать не стоит."""
+    lines = []
+    async for old in channel.history(limit=CHATTER_HISTORY):
+        if not lines and old.author == bot.user:
+            return None  # последнее сообщение в канале — наше: не разговариваем сами с собой
+        text = old.clean_content[:300]
+        if text:
+            name = "ты (бот)" if old.author == bot.user else old.author.display_name
+            lines.append(f"{name}: {text}")
+    if len(lines) < 3:  # слишком мало сообщений — тему не понять
+        return None
+    lines.reverse()  # history идёт от новых к старым
+    response = await ai_generate(CHATTER_TASK.format(chat="\n".join(lines)), ai_system_prompt())
+    text = (response.text or "").strip()
+    if not text or IGNORE_TAG.search(text):
+        return None
+    text = REMEMBER_TAG.sub("", text).strip()
+    return to_one_line(text) if AI_ONE_LINE else text
+
+
+@tasks.loop(minutes=CHATTER_INTERVAL)
+async def chatter_loop():
+    if ai_client is None or CHATTER_CHANCE <= 0:
+        return
+    now = time.time()
+    for guild_id, (channel_id, active_at) in list(last_activity.items()):
+        if now - active_at > CHATTER_INTERVAL * 60:  # за последний интервал никто не писал — чат "спит"
+            continue
+        if random.random() * 100 >= CHATTER_CHANCE:  # бросаем "кубик": писать с шансом CHATTER_CHANCE %
+            continue
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            text = await chatter_text(channel)
+            if text:
+                await channel.send(text[:1900], allowed_mentions=NO_PINGS)
+                error_logger.info("Случайная реплика: сервер=%s канал=%s", guild_id, channel_id)
+        except Exception as error:  # ошибка на одном сервере не должна мешать остальным
+            await report_error("Случайная реплика в чат", error, guild_id, channel=channel)
+
+
+@chatter_loop.before_loop
+async def before_chatter_loop():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_message(message):
     """Вызывается на каждое новое сообщение в любом канале, который видит бот."""
     if message.author.bot or message.guild is None:  # не реагируем на ботов (и на себя) и на личные сообщения
         return
+    last_activity[message.guild.id] = (message.channel.id, time.time())  # здесь сейчас общаются (для реплик)
     if ai_client and is_addressed_to_bot(message):  # к боту обратились — отвечает ИИ
         await ai_reply(message)
     else:
@@ -2650,6 +2726,7 @@ async def setup_hook():
     print(f"Зарегистрировано слэш-команд: {len(synced)}")
     voice_xp_loop.start()           # запускаем начисление опыта за голосовые каналы (раз в минуту)
     daily_loop.start()              # и проверку утренних/вечерних сообщений (раз в минуту)
+    chatter_loop.start()            # и случайные реплики по теме чата (раз в CHATTER_INTERVAL минут)
 
 
 @bot.event
