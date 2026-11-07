@@ -11,7 +11,7 @@
 #  Каналы:  /games_channel — ранги, рейтинги и игры работают только в выбранном канале
 #           /log_channel — куда бот присылает свои ошибки (а ещё они всегда пишутся в bot.log)
 #  ИИ:      характер тсундере; /ask, /ai_limits, а также ответ, если упомянуть бота (@бот) или ответить ему
-#           память: /remember, /memory, /forget (бот помнит разговор и факты о людях)
+#           память разговора: последние сообщения в канале; /forget — стереть её
 #           картинки: бот видит изображения в сообщении и в том, на которое ответили
 #  Автоответы на слова «привет» и «даня»
 #  Грубость: на мат и непотребства ИИ не отвечает (слова — в config/bad_words.txt, остальное решает сам ИИ),
@@ -819,16 +819,8 @@ db.execute("""
     )
 """)
 
-# Долгая память ИИ: факты о людях ("любит рок", "учится на радиотехника"...).
-db.execute("""
-    CREATE TABLE IF NOT EXISTS ai_memory (
-        id       INTEGER PRIMARY KEY,
-        guild_id INTEGER,                -- сервер (на разных серверах — разная память)
-        user_id  INTEGER,                -- о ком факт
-        fact     TEXT,                   -- сам факт
-        created  REAL
-    )
-""")
+# Долгой памяти о людях (факты вроде "любит рок") больше нет — стираем старую таблицу с фактами, если она осталась.
+db.execute("DROP TABLE IF EXISTS ai_memory")
 
 # Города для /weather, которые добавили на сервере через /weather_cities.
 db.execute("""
@@ -1737,8 +1729,6 @@ AI_COOLDOWN = setting("ai", "cooldown_seconds", 5)         # один челов
 AI_DAILY_LIMIT = setting("ai", "daily_limit_per_user", 50)  # и не больше N вопросов в день
 AI_HISTORY_LIMIT = setting("ai", "history_limit", 20)       # память разговора: сколько последних сообщений помнить
                                # (вопросы и ответы вместе; 20 = 10 пар "вопрос — ответ")
-AI_MAX_FACTS = 20              # долгая память: сколько фактов о каждом человеке можно запомнить
-AI_FACT_LENGTH = 200           # максимальная длина одного факта (в символах)
 AI_MAX_IMAGES = 3              # сколько картинок из одного сообщения отправлять ИИ
 AI_MAX_IMAGE_MB = 5            # картинки тяжелее 5 МБ не отправляем (весь запрос к Gemini — не больше 20 МБ)
 AI_IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/heic", "image/heif")  # форматы, которые понимает Gemini
@@ -1756,22 +1746,21 @@ try:
 except Exception:
     PACIFIC = datetime.timezone(datetime.timedelta(hours=-8))  # запасной вариант: UTC-8 (летом ошибка на час)
 
-# Метка, которой ИИ сообщает боту "запомни этот факт". Бот находит её в ответе, сохраняет факт и убирает метку.
+# Старая метка "запомни этот факт". Долгой памяти больше нет, но в старых разговорах ИИ мог её видеть —
+# поэтому, если она вдруг появится в ответе, бот просто её вырежет.
 REMEMBER_TAG = re.compile(r"\[ЗАПОМНИТЬ:\s*(.+?)\]", re.IGNORECASE)
 
-# Технические правила для ИИ: оформление для Discord, формулы и память. Они всегда добавляются к характеру
-# из config/prompt.txt — так правка характера не сломает формулы и команду «запомни».
+# Технические правила для ИИ: оформление для Discord, формулы, память разговора и грубость. Они всегда
+# добавляются к характеру из config/prompt.txt — так правка характера их не сломает.
 AI_TECH_RULES = """Ответ показывается в Discord, поэтому:
 - не используй заголовки (#) и таблицы — Discord их плохо показывает; списки и **жирный** можно;
 - формулы пиши без LaTeX, обычными символами, и всегда оформляй как код в обратных кавычках:
   одну формулу в строке — `Δ = 2d·cos(θ) = m·λ`, несколько формул подряд — блоком между строками ```.
   Не пиши "$\\Delta = ...$".
 Перед вопросом тебе показывают несколько последних сообщений чата — это только контекст.
-Память: тебе передают ваш прошлый разговор в этом канале и факты, которые ты помнишь о собеседнике.
-Используй их естественно, когда это к месту, но не пересказывай без повода.
-Если собеседник ПРЯМО просит что-то запомнить о нём (например, «запомни, что я люблю рок»),
-допиши в самом конце ответа отдельной строкой метку [ЗАПОМНИТЬ: короткий факт о нём в третьем лице],
-например [ЗАПОМНИТЬ: любит рок]. Без прямой просьбы метку не ставь.
+Память: тебе передают ваш недавний разговор в этом канале. Используй его естественно, когда это к месту,
+но не пересказывай без повода. Долгой памяти о людях у тебя нет — если просят что-то запомнить навсегда,
+честно скажи, что помнишь только недавний разговор.
 Грубость: если собеседник обращается к тебе с матом (в том числе замаскированным, например «х*й»),
 всерьёз оскорбляет тебя или других, или пишет пошлости и непотребства — не отвечай на это сообщение
 и не объясняй почему, а напиши ТОЛЬКО метку [ИГНОР]. Лёгкие шутки, «бака» и обычные вопросы о
@@ -1889,29 +1878,6 @@ def history_clear(channel_id):
     return cursor.rowcount
 
 
-# --- Долгая память о людях (таблица ai_memory) ---
-
-def facts_get(guild_id, user_id):
-    """Все факты о человеке на этом сервере: список пар (номер в базе, текст), от старых к новым."""
-    return db.execute(
-        "SELECT id, fact FROM ai_memory WHERE guild_id = ? AND user_id = ? ORDER BY id",
-        (guild_id, user_id),
-    ).fetchall()
-
-
-def fact_add(guild_id, user_id, fact):
-    """Запоминает факт. Возвращает "ok", "full" (память заполнена) или "duplicate" (уже помним)."""
-    fact = fact.strip()[:AI_FACT_LENGTH]
-    facts = facts_get(guild_id, user_id)
-    if any(old.lower() == fact.lower() for _, old in facts):  # такой факт уже есть
-        return "duplicate"
-    if len(facts) >= AI_MAX_FACTS:
-        return "full"
-    db.execute("INSERT INTO ai_memory (guild_id, user_id, fact, created) VALUES (?, ?, ?, ?)",
-               (guild_id, user_id, fact, time.time()))
-    db.commit()
-    return "ok"
-
 
 # --- Картинки ---
 
@@ -2013,16 +1979,11 @@ async def ai_generate(contents, system):
 
 
 async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
-    """Отправляет вопрос в Gemini вместе с памятью и возвращает готовый текст ответа.
+    """Отправляет вопрос в Gemini вместе с памятью разговора и возвращает готовый текст ответа.
     question — текст вопроса, user — кто спрашивает, context — последние сообщения чата (необязательно),
     images — список пар (байты картинки, формат) из download_images (необязательно)."""
-    guild_key = guild_id or 0  # в личных сообщениях сервера нет — используем 0
-
-    # Инструкция + дата + то, что бот помнит о собеседнике
+    # Инструкция + сегодняшняя дата
     system = ai_system_prompt() + f"\nСегодня {datetime.date.today():%d.%m.%Y}."
-    facts = facts_get(guild_key, user.id)
-    if facts:
-        system += f"\nЧто ты помнишь о собеседнике ({user.display_name}):\n" + "\n".join(f"- {fact}" for _, fact in facts)
 
     # Разговор: сначала прошлые сообщения из памяти, потом новый вопрос.
     # Формат Gemini: {"role": кто говорит, "parts": [{"text": текст}]}
@@ -2045,15 +2006,7 @@ async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
         error_logger.info("ИИ промолчала на грубость: пользователь=%s канал=%s", user.id, channel_id)
         return None
 
-    # Ищем метки [ЗАПОМНИТЬ: ...], сохраняем факты и убираем метки из текста
-    notes = []
-    for fact in REMEMBER_TAG.findall(text):
-        result = fact_add(guild_key, user.id, fact)
-        if result == "ok":
-            notes.append(f"📝 *Запомнила: {fact.strip()[:AI_FACT_LENGTH]}*")
-        elif result == "full":
-            notes.append(f"📝 *Память о тебе заполнена ({AI_MAX_FACTS} фактов) — удали лишнее через /forget.*")
-    text = REMEMBER_TAG.sub("", text).strip()
+    text = REMEMBER_TAG.sub("", text).strip()  # старая метка памяти, если вдруг появилась, — вырезаем
     if AI_ONE_LINE:
         text = to_one_line(text)  # склеиваем абзацы в одну строку (в памяти тоже — чтобы ИИ не копировал абзацы)
 
@@ -2064,8 +2017,6 @@ async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
     # finish_reason — почему модель остановилась. MAX_TOKENS значит "упёрлась в предел длины".
     if response.candidates and "MAX_TOKENS" in str(response.candidates[0].finish_reason):
         text += "\n\n✂️ *Ответ обрезан — слишком длинный. Попроси объяснить короче или по частям.*"
-    if notes:
-        text += "\n" + "\n".join(notes)
     return text
 
 
@@ -3082,66 +3033,10 @@ async def ai_limits(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)  # видит только сам человек
 
 
-@bot.tree.command(name="remember", description="Попросить бота запомнить факт о тебе")
-@app_commands.describe(fact="Что запомнить, например: люблю рок, учусь на радиотехника")
-async def remember(interaction: discord.Interaction, fact: app_commands.Range[str, 1, AI_FACT_LENGTH]):
-    # Range[str, 1, AI_FACT_LENGTH] — Discord не даст написать пустой факт или длиннее 200 символов
-    result = fact_add(interaction.guild_id or 0, interaction.user.id, fact)
-    if result == "ok":
-        text = f"📝 Запомнила: *{fact.strip()}*"
-    elif result == "duplicate":
-        text = "Я это и так помню!"
-    else:  # "full"
-        text = f"Память о тебе заполнена ({AI_MAX_FACTS} фактов). Удали лишнее через /forget."
-    await interaction.response.send_message(text, ephemeral=True)  # видит только сам человек
-
-
-@bot.tree.command(name="memory", description="Что бот помнит о тебе")
-async def memory(interaction: discord.Interaction):
-    facts = facts_get(interaction.guild_id or 0, interaction.user.id)
-    if facts:
-        # Нумеруем с 1 — по этим номерам факты можно удалять через /forget
-        lines = [f"{number_}. {fact}" for number_, (_, fact) in enumerate(facts, 1)]
-        text = f"🧠 Что я помню о тебе ({len(facts)}/{AI_MAX_FACTS}):\n" + "\n".join(lines)
-    else:
-        text = "🧠 Я пока ничего о тебе не помню. Скажи мне «запомни, что …» или используй /remember."
-    history_count = len(history_load(interaction.channel_id))
-    text += f"\n\n💬 В памяти разговора в этом канале сообщений: {history_count}/{AI_HISTORY_LIMIT}."
-    await interaction.response.send_message(text, ephemeral=True)
-
-
-@bot.tree.command(name="forget", description="Стереть память бота")
-@app_commands.describe(what="Что стереть", number="Номер факта из /memory (только для «Один факт»)")
-@app_commands.choices(what=[
-    app_commands.Choice(name="🗑️ Один факт обо мне (по номеру)", value="fact"),
-    app_commands.Choice(name="🧹 Все факты обо мне", value="facts"),
-    app_commands.Choice(name="💬 Память разговора в этом канале", value="chat"),
-])
-async def forget(interaction: discord.Interaction, what: app_commands.Choice[str], number: int | None = None):
-    guild_key = interaction.guild_id or 0
-
-    if what.value == "chat":
-        removed = history_clear(interaction.channel_id)
-        await interaction.response.send_message(f"💬 Память разговора в этом канале стёрта (сообщений: {removed}).")
-        return
-
-    facts = facts_get(guild_key, interaction.user.id)
-    if what.value == "facts":
-        db.execute("DELETE FROM ai_memory WHERE guild_id = ? AND user_id = ?", (guild_key, interaction.user.id))
-        db.commit()
-        await interaction.response.send_message(f"🧹 Стёрла всё, что помнила о тебе (фактов: {len(facts)}).",
-                                                ephemeral=True)
-        return
-
-    # what.value == "fact" — удаляем один факт по номеру из /memory
-    if number is None or not 1 <= number <= len(facts):
-        await interaction.response.send_message(
-            "Укажи номер факта в поле `number` — номера видно в /memory.", ephemeral=True)
-        return
-    fact_id, fact_text = facts[number - 1]  # номера в /memory начинаются с 1, а в списке — с 0
-    db.execute("DELETE FROM ai_memory WHERE id = ?", (fact_id,))
-    db.commit()
-    await interaction.response.send_message(f"🗑️ Забыла: *{fact_text}*", ephemeral=True)
+@bot.tree.command(name="forget", description="Стереть память разговора с ботом в этом канале")
+async def forget(interaction: discord.Interaction):
+    removed = history_clear(interaction.channel_id)
+    await interaction.response.send_message(f"💬 Память разговора в этом канале стёрта (сообщений: {removed}).")
 
 
 @bot.tree.command(name="weather", description="Погода сейчас и на 3 дня")
