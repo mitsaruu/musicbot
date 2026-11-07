@@ -2321,17 +2321,38 @@ def slots_multiplier(reels):
 
 
 # --- Блэкджек ---
+# Правила: дилер добирает до 17, блэкджек платит 3 к 2. Можно удвоить ставку (одна карта и стоп)
+# и разделить пару (до BLACKJACK_MAX_HANDS рук; тузы после разделения получают по одной карте).
+# Карты сдаются из общего "башмака" сервера — BLACKJACK_DECKS колод вместе, как в казино.
 
 CARD_RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
 CARD_SUITS = ["♠", "♥", "♦", "♣"]
-blackjack_players = set()  # id тех, кто сейчас играет: нельзя начать вторую партию, не закончив первую
+BLACKJACK_DECKS = 3         # сколько колод в башмаке (3 × 52 = 156 карт)
+BLACKJACK_RESHUFFLE = 0.25  # когда остаётся меньше четверти карт — башмак собирают и перемешивают заново
+BLACKJACK_MAX_HANDS = 4     # больше скольких рук разделять нельзя
+blackjack_players = set()   # id тех, кто сейчас играет: нельзя начать вторую партию, не закончив первую
+blackjack_shoes = {}        # id сервера → карты, оставшиеся в башмаке
 
 
-def new_deck():
-    """Новая перемешанная колода из 52 карт. Карта — пара (достоинство, масть)."""
-    deck = [(rank, suit) for rank in CARD_RANKS for suit in CARD_SUITS]
-    random.shuffle(deck)
-    return deck
+def new_shoe():
+    """Новый перемешанный башмак из BLACKJACK_DECKS колод. Карта — пара (достоинство, масть)."""
+    shoe = [(rank, suit) for _ in range(BLACKJACK_DECKS) for rank in CARD_RANKS for suit in CARD_SUITS]
+    random.shuffle(shoe)
+    return shoe
+
+
+def shoe_for(guild_id):
+    """Башмак сервера. Если карт осталось мало — перемешиваем новый (перед раздачей, а не посреди партии)."""
+    shoe = blackjack_shoes.get(guild_id)
+    if shoe is None or len(shoe) < BLACKJACK_DECKS * 52 * BLACKJACK_RESHUFFLE:
+        shoe = blackjack_shoes[guild_id] = new_shoe()
+    return shoe
+
+
+def card_value(card):
+    """Очки одной карты для сравнения при разделении: картинки и десятка — по 10, туз — 11."""
+    rank = card[0]
+    return 11 if rank == "A" else 10 if rank in ("J", "Q", "K") else int(rank)
 
 
 def hand_value(hand):
@@ -2356,39 +2377,76 @@ def hand_text(hand, hide_second=False):
     """Карты текстом, например `A♠` `10♥`. hide_second — спрятать вторую карту дилера."""
     cards = [f"`{rank}{suit}`" for rank, suit in hand]
     if hide_second:
-        cards[1] = "`??`"
+        cards[1] = "`🂠`"
     return " ".join(cards)
 
 
 class BlackjackGame(discord.ui.View):
-    """Одна партия в блэкджек. View — набор кнопок под сообщением («Ещё карту», «Хватит»)."""
+    """Одна партия в блэкджек. View — набор кнопок под сообщением: Ещё, Хватит, Удвоить, Разделить."""
 
     def __init__(self, guild_id, player, bet):
         super().__init__(timeout=120)  # если 2 минуты не нажимать кнопки — бот сам нажмёт «Хватит»
         self.guild_id = guild_id
         self.player = player
-        self.bet = bet
-        self.deck = new_deck()
-        self.hand = [self.deck.pop(), self.deck.pop()]    # карты игрока (pop — взять карту из колоды)
-        self.dealer = [self.deck.pop(), self.deck.pop()]  # карты дилера
-        self.message = None   # сообщение с игрой — нужно, чтобы обновить его, если время выйдет
-        self.result = None    # итог партии текстом; пока None — партия идёт
-        self.color = 0x8B5CF6 # цвет полоски слева от карточки
+        self.shoe = shoe_for(guild_id)
+        self.hands = [[self.shoe.pop(), self.shoe.pop()]]  # руки игрока (после разделения их несколько)
+        self.bets = [bet]                                   # ставка на каждой руке
+        self.doubled = [False]                              # удвоена ли ставка на руке
+        self.current = 0                                    # какую руку игрок сейчас играет
+        self.dealer = [self.shoe.pop(), self.shoe.pop()]    # карты дилера
+        self.message = None    # сообщение с игрой — нужно, чтобы обновить его, если время выйдет
+        self.result = None     # итог партии текстом; пока None — партия идёт
+        self.color = 0x3B82F6  # цвет полоски слева от карточки
+        self.update_buttons()
+
+    # --- состояние ---
+
+    @property
+    def hand(self):
+        """Рука, которую игрок играет сейчас."""
+        return self.hands[self.current]
+
+    def balance(self):
+        return get_wallet(self.guild_id, self.player)[0]
+
+    def can_double(self):
+        """Удвоить можно на двух первых картах руки, если хватает монет ещё на одну такую же ставку."""
+        return len(self.hand) == 2 and self.balance() >= self.bets[self.current]
+
+    def can_split(self):
+        """Разделить можно пару одинаковых по очкам карт, если хватает монет и рук ещё не слишком много."""
+        return (len(self.hand) == 2 and card_value(self.hand[0]) == card_value(self.hand[1])
+                and len(self.hands) < BLACKJACK_MAX_HANDS and self.balance() >= self.bets[self.current])
+
+    def update_buttons(self):
+        """Серые (выключенные) кнопки — то, что сейчас сделать нельзя."""
+        self.double_down.disabled = not self.can_double()
+        self.split.disabled = not self.can_split()
+
+    # --- карточка ---
 
     def embed(self):
         """Карточка с текущим состоянием партии."""
         finished = self.result is not None
-        embed = discord.Embed(title="🃏 Блэкджек", color=self.color)
-        embed.add_field(name=f"Твои карты — {hand_value(self.hand)}", value=hand_text(self.hand), inline=False)
+        embed = discord.Embed(color=self.color)
+        embed.set_author(name=self.player.display_name, icon_url=self.player.display_avatar.url)
+        for i, hand in enumerate(self.hands):
+            if len(self.hands) == 1:
+                title = "Твоя рука"
+            else:
+                arrow = "▶ " if i == self.current and not finished else ""
+                title = f"{arrow}Рука {i + 1}"
+            extra = f"\nСтавка: {money_text(self.bets[i])}" + (" (×2)" if self.doubled[i] else "")
+            embed.add_field(name=title, value=f"{hand_text(hand)}\n\nОчки: **{hand_value(hand)}**{extra}")
         if finished:  # в конце показываем все карты дилера
-            embed.add_field(name=f"Карты дилера — {hand_value(self.dealer)}", value=hand_text(self.dealer),
-                            inline=False)
+            embed.add_field(name="Рука дилера",
+                            value=f"{hand_text(self.dealer)}\n\nОчки: **{hand_value(self.dealer)}**")
         else:         # пока игра идёт, вторая карта дилера скрыта
-            embed.add_field(name="Карты дилера — ?", value=hand_text(self.dealer, hide_second=True), inline=False)
-        embed.add_field(name="Ставка", value=money_text(self.bet), inline=False)
+            embed.add_field(name="Рука дилера",
+                            value=f"{hand_text(self.dealer, hide_second=True)}\n\nОчки: **{card_value(self.dealer[0])}**")
         if finished:
             embed.add_field(name="Итог", value=self.result, inline=False)
-        embed.set_footer(text=f"Игрок: {self.player.display_name}")
+        embed.set_footer(text=f"Карт в колоде: {len(self.shoe)}")
         return embed
 
     async def interaction_check(self, interaction):
@@ -2398,64 +2456,130 @@ class BlackjackGame(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Ещё карту", emoji="🃏", style=discord.ButtonStyle.primary)
-    async def hit(self, interaction, button):
-        self.hand.append(self.deck.pop())
-        if hand_value(self.hand) >= 21:  # перебор или ровно 21 — дальше брать нечего
-            self.finish()
-        # view=None убирает кнопки, когда партия закончилась
+    async def refresh(self, interaction):
+        """Перерисовывает сообщение. view=None убирает кнопки, когда партия закончилась."""
+        if self.result is None:
+            self.update_buttons()
         await interaction.response.edit_message(embed=self.embed(), view=self if self.result is None else None)
 
-    @discord.ui.button(label="Хватит", emoji="✋", style=discord.ButtonStyle.secondary)
+    # --- ходы ---
+
+    def next_hand(self):
+        """Текущая рука сыграна — переходим к следующей, а если рук больше нет — к дилеру и итогу."""
+        while True:
+            self.current += 1
+            if self.current >= len(self.hands):
+                self.current = len(self.hands) - 1
+                self.finish()
+                return
+            hand = self.hand
+            if len(hand) == 1:                 # рука после разделения — добираем ей вторую карту
+                hand.append(self.shoe.pop())
+            if hand[0][0] == "A" and len(self.hands) > 1:
+                continue                       # разделённые тузы получают только по одной карте
+            if hand_value(hand) < 21:
+                return                         # на этой руке есть что решать
+
+    @discord.ui.button(label="Ещё", style=discord.ButtonStyle.primary)
+    async def hit(self, interaction, button):
+        self.hand.append(self.shoe.pop())
+        if hand_value(self.hand) >= 21:  # перебор или ровно 21 — на этой руке брать больше нечего
+            self.next_hand()
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Хватит", style=discord.ButtonStyle.success)
     async def stand(self, interaction, button):
-        self.finish()
-        await interaction.response.edit_message(embed=self.embed(), view=None)
+        self.next_hand()
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Удвоить", style=discord.ButtonStyle.secondary)
+    async def double_down(self, interaction, button):
+        if not self.can_double():
+            await interaction.response.send_message("Удвоить сейчас нельзя 🙂", ephemeral=True)
+            return
+        add_money(self.guild_id, self.player, -self.bets[self.current])  # списываем ещё одну такую же ставку
+        self.bets[self.current] *= 2
+        self.doubled[self.current] = True
+        self.hand.append(self.shoe.pop())  # после удвоения — ровно одна карта, и рука останавливается
+        self.next_hand()
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Разделить", style=discord.ButtonStyle.secondary)
+    async def split(self, interaction, button):
+        if not self.can_split():
+            await interaction.response.send_message("Разделить сейчас нельзя 🙂", ephemeral=True)
+            return
+        bet = self.bets[self.current]
+        add_money(self.guild_id, self.player, -bet)  # на вторую руку — такая же ставка
+        second = self.hand.pop()                     # вторая карта уходит в новую руку
+        self.hands.insert(self.current + 1, [second])
+        self.bets.insert(self.current + 1, bet)
+        self.doubled.insert(self.current + 1, False)
+        self.hand.append(self.shoe.pop())            # каждой руке добираем вторую карту
+        if self.hand[0][0] == "A" or hand_value(self.hand) == 21:
+            self.next_hand()  # разделённые тузы — по одной карте; 21 — решать нечего
+        await self.refresh(interaction)
+
+    # --- итог ---
 
     def finish(self):
-        """Дилер добирает карты, считаем итог и выплачиваем выигрыш."""
-        player = hand_value(self.hand)
-        player_blackjack = len(self.hand) == 2 and player == 21                   # 21 с двух первых карт
+        """Дилер добирает карты, считаем итог по каждой руке и выплачиваем выигрыш."""
+        split = len(self.hands) > 1
         dealer_blackjack = len(self.dealer) == 2 and hand_value(self.dealer) == 21
-        # Дилер берёт карты, пока у него меньше 17 (если у игрока нет перебора и ни у кого нет блэкджека)
-        if player <= 21 and not player_blackjack and not dealer_blackjack:
+        # Блэкджек — только 21 с двух первых карт без разделения (после разделения 21 — обычные 21)
+        player_blackjack = not split and len(self.hands[0]) == 2 and hand_value(self.hands[0]) == 21
+        alive = any(hand_value(hand) <= 21 for hand in self.hands)
+        # Дилер берёт карты, пока у него меньше 17 (если у игрока есть рука без перебора и ни у кого нет блэкджека)
+        if alive and not player_blackjack and not dealer_blackjack:
             while hand_value(self.dealer) < 17:
-                self.dealer.append(self.deck.pop())
+                self.dealer.append(self.shoe.pop())
         dealer = hand_value(self.dealer)
 
-        # payout — сколько вернуть игроку (ставка уже списана в начале)
-        if player > 21:
-            payout, self.result = 0, f"💥 Перебор! Проигрыш: {money_text(self.bet)}."
-        elif player_blackjack and dealer_blackjack:
-            payout, self.result = self.bet, "🤝 Блэкджек у обоих — ничья, ставка возвращена."
-        elif player_blackjack:
-            payout = self.bet + self.bet * 3 // 2  # блэкджек платит 3 к 2
-            self.result = f"🎉 Блэкджек! Выигрыш: +{money_text(payout - self.bet)}."
-        elif dealer_blackjack:
-            payout, self.result = 0, f"😔 У дилера блэкджек. Проигрыш: {money_text(self.bet)}."
-        elif dealer > 21:
-            payout, self.result = self.bet * 2, f"🎉 Дилер перебрал! Выигрыш: +{money_text(self.bet)}."
-        elif player > dealer:
-            payout, self.result = self.bet * 2, f"🎉 Победа! Выигрыш: +{money_text(self.bet)}."
-        elif player == dealer:
-            payout, self.result = self.bet, "🤝 Ничья — ставка возвращена."
-        else:
-            payout, self.result = 0, f"😔 У дилера больше. Проигрыш: {money_text(self.bet)}."
+        total_bet = sum(self.bets)
+        payout = 0  # сколько вернуть игроку (ставки уже списаны)
+        lines = []
+        for i, (hand, bet) in enumerate(zip(self.hands, self.bets)):
+            player = hand_value(hand)
+            prefix = f"Рука {i + 1}: " if split else ""
+            if player > 21:
+                lines.append(f"{prefix}💥 Перебор, −{money_text(bet)}")
+            elif player_blackjack and dealer_blackjack:
+                payout += bet
+                lines.append("🤝 Блэкджек у обоих — ничья, ставка возвращена")
+            elif player_blackjack:
+                win = bet * 3 // 2  # блэкджек платит 3 к 2
+                payout += bet + win
+                lines.append(f"🎉 Блэкджек! +{money_text(win)}")
+            elif dealer_blackjack:
+                lines.append(f"{prefix}😔 У дилера блэкджек, −{money_text(bet)}")
+            elif dealer > 21 or player > dealer:
+                payout += bet * 2
+                why = "Дилер перебрал" if dealer > 21 else "Победа"
+                lines.append(f"{prefix}🎉 {why}! +{money_text(bet)}")
+            elif player == dealer:
+                payout += bet
+                lines.append(f"{prefix}🤝 Ничья, ставка возвращена")
+            else:
+                lines.append(f"{prefix}😔 У дилера больше, −{money_text(bet)}")
 
-        if payout > self.bet:
+        if payout > total_bet:
             self.color = 0x22C55E  # зелёный — выигрыш
-        elif payout == self.bet:
+        elif payout == total_bet:
             self.color = 0x94A3B8  # серый — ничья
         else:
             self.color = 0xEF4444  # красный — проигрыш
 
-        new_balance = add_money(self.guild_id, self.player, payout) if payout else get_wallet(self.guild_id, self.player)[0]
-        self.result += f"\nБаланс: {money_text(new_balance)}"
+        new_balance = add_money(self.guild_id, self.player, payout) if payout else self.balance()
+        self.result = "\n".join(lines) + f"\nБаланс: {money_text(new_balance)}"
         blackjack_players.discard(self.player.id)  # игрок свободен — можно начинать новую партию
         self.stop()  # останавливаем View: кнопки больше не реагируют
 
     async def on_timeout(self):
-        """Вызывается, если 2 минуты никто не нажимал кнопки: бот сам говорит «Хватит»."""
+        """Вызывается, если 2 минуты никто не нажимал кнопки: бот сам говорит «Хватит» на всех руках."""
         if self.result is None:
+            for hand in self.hands:
+                if len(hand) == 1:  # рука после разделения, до которой не дошли, — добираем ей вторую карту
+                    hand.append(self.shoe.pop())
             self.finish()
             if self.message:
                 try:
@@ -3435,7 +3559,7 @@ async def slots(interaction: discord.Interaction, bet: app_commands.Range[int, M
         allowed_mentions=NO_PINGS)
 
 
-@bot.tree.command(name="blackjack", description="Сыграть в блэкджек на монеты (победа ×2, блэкджек ×2.5)")
+@bot.tree.command(name="blackjack", description="Блэкджек на монеты: можно удвоить и разделить (победа ×2, блэкджек ×2.5)")
 @app_commands.describe(bet="Сколько монет поставить")
 @app_commands.guild_only()
 async def blackjack(interaction: discord.Interaction, bet: app_commands.Range[int, MIN_BET, MAX_BET]):
