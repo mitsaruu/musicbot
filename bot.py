@@ -3917,11 +3917,15 @@ async def open_case(interaction: discord.Interaction, kind: app_commands.Choice[
 async def show_cases(interaction: discord.Interaction):
     lines = [" · ".join(f"{c['emoji']} **{c['name']}** — {money_text(c['price'])}" for c in PET_CASES.values())]
     for rarity, info in PET_RARITIES.items():
-        pets = ", ".join(f"{e} {n} ({money_text(income)}/ч)" for e, n, r, income in PET_SPECIES.values() if r == rarity)
+        species = sorted((key for key, value in PET_SPECIES.items() if value[2] == rarity),
+                         key=lambda key: PET_SPECIES[key][3])  # от меньшего дохода к большему
+        pets = "\n".join(f"{PET_SPECIES[key][0]} {PET_SPECIES[key][1]} — {money_text(PET_SPECIES[key][3])}/ч, "
+                         f"корм от {number(pet_feed_cost(key, 1))}" for key in species)
         odds = " · ".join(f"{c['emoji']} {info[key]:g}%" for key, c in PET_CASES.items())
         lines.append(f"**{info['name']}** — {odds}\n{pets}")
     embed = discord.Embed(color=0x8B5CF6, title="🎁 Кейсы с питомцами", description="\n\n".join(lines))
-    embed.set_footer(text="Каждый уровень питомца: +25% к доходу.")
+    embed.set_footer(text="Корм поднимает питомца на 1 уровень (+25% к доходу) и дорожает с каждым уровнем: "
+                          "на ур. 2 — цена «корм от», на ур. 3 — вдвое больше, на ур. 4 — втрое и так далее.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -3941,7 +3945,8 @@ async def show_pets(interaction: discord.Interaction, member: discord.Member | N
         income, pending = pet_income(species, level), pet_pending(species, level, last_collect, now)
         total_income += income
         total_pending += pending
-        lines.append(f"`{number_}.` {pet_title(species, level)} — {money_text(income)}/ч, накопил {number(pending)}")
+        feed = f"корм {number(pet_feed_cost(species, level))}" if level < PET_MAX_LEVEL else "макс. уровень"
+        lines.append(f"`{number_}.` {pet_title(species, level)} — {money_text(income)}/ч, накопил {number(pending)}, {feed}")
     embed = discord.Embed(color=0x22C55E, title=f"🐾 Питомцы {member.display_name} ({len(pets)}/{MAX_PETS})",
                           description="\n".join(lines))
     embed.add_field(name="Доход", value=f"{money_text(total_income)} в час")
