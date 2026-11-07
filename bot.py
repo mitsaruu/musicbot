@@ -6,6 +6,7 @@
 #  Разное:  /weather, /weather_cities, /dice, /roll, /divination, /pogonyalo
 #  Игра:    /dick_growth, /dick_size, /dick_leaderboard
 #  Деньги:  /work, /balance, /give_money, /money_leaderboard, /coinflip, /slots, /blackjack
+#  Питомцы: /case, /cases, /pets, /pets_collect, /pet_feed, /pet_sell — питомцы из кейсов приносят монеты
 #  Каждый день: /daily_setup, /daily_off, /daily_test — утренние и вечерние сообщения с фактами
 #  Иногда: раз в 20 минут с шансом 5% бот сам пишет реплику по теме чата (settings.ini, [chatter])
 #  Каналы:  /games_channel — ранги, рейтинги и игры работают только в выбранном канале
@@ -16,6 +17,7 @@
 #  Автоответы на слова «привет» и «даня»
 #  Грубость: на мат и непотребства ИИ не отвечает (слова — в config/bad_words.txt, остальное решает сам ИИ),
 #           со второго раза подряд — тайм-аут: 1, 5, 10, 30, 60 минут (settings.ini, раздел [moderation])
+#  Модерация: модератор просит бота «дай варн / тайм-аут @участнику» — бот выполняет; /warns, /warns_clear
 #  Настройки: папка config — prompt.txt (характер ИИ), auto_replies.txt (автоответы),
 #             bad_words.txt (слова, на которые бот молчит), settings.ini (числа)
 # ============================================================
@@ -163,6 +165,19 @@ work_cooldown_hours = 8
 ; Минимальная ставка в играх
 min_bet = 10
 
+[pets]
+; Питомцы из кейсов (/case): каждый сам приносит монеты в час, их забирают командой /pets_collect.
+; Цена обычного и золотого кейса (в золотом нет обычных питомцев)
+case_price = 1000
+gold_case_price = 5000
+; Сколько питомцев может быть у одного человека и до какого уровня их можно вырастить (/pet_feed)
+max_pets = 10
+max_level = 20
+; Доход копится не дольше стольких часов — потом питомцы ждут, пока его заберут
+collect_cap_hours = 24
+; Сколько процентов вложенных монет (кейс + корм) вернёт продажа питомца (/pet_sell)
+sell_percent = 50
+
 [dick_game]
 ; На сколько сантиметров может измениться размер за раз и как часто можно играть (в часах)
 growth_min = -10
@@ -172,7 +187,7 @@ growth_cooldown_hours = 24
 [channels]
 ; Команды, которые работают только в канале для игр (его выбирают в Discord командой /games_channel).
 ; Пиши названия через запятую. Пока канал не выбран, все команды работают везде.
-games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, dice, roll, divination, pogonyalo
+games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, divination, pogonyalo
 
 [moderation]
 ; Тайм-ауты за грубость к боту (мат, оскорбления, непотребства). Первый раз бот просто молчит,
@@ -325,7 +340,8 @@ def is_rude(text):
 # Список берётся из settings.ini, раздел [channels], строка games_commands — названия через запятую.
 DEFAULT_GAMES_COMMANDS = ("rank, leaderboard, top_chart_month, money_leaderboard, "
                           "dick_growth, dick_size, dick_leaderboard, work, balance, give_money, "
-                          "coinflip, slots, blackjack, dice, roll, divination, pogonyalo")
+                          "coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, "
+                          "dice, roll, divination, pogonyalo")
 GAMES_COMMANDS = {name.strip().lstrip("/").lower()
                   for name in setting("channels", "games_commands", DEFAULT_GAMES_COMMANDS).split(",")
                   if name.strip()}
@@ -804,6 +820,31 @@ db.execute("""
         count     INTEGER,   -- сколько раз подряд человек грубил боту
         last_time REAL,      -- когда последний раз (чтобы со временем обнулять)
         PRIMARY KEY (guild_id, user_id)
+    )
+""")
+
+# Варны (предупреждения), которые ИИ выдала по просьбе модератора. Смотреть — /warns.
+db.execute("""
+    CREATE TABLE IF NOT EXISTS warns (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     INTEGER,
+        user_id      INTEGER,   -- кому
+        moderator_id INTEGER,   -- кто попросил
+        reason       TEXT,
+        created      REAL
+    )
+""")
+
+# Питомцы из кейсов: растут (уровень), пока их кормят, и сами приносят монеты.
+db.execute("""
+    CREATE TABLE IF NOT EXISTS pets (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     INTEGER,
+        user_id      INTEGER,
+        species      TEXT,               -- вид, ключ из PET_SPECIES
+        level        INTEGER DEFAULT 1,
+        last_collect REAL,               -- с какого момента копится доход
+        spent        INTEGER DEFAULT 0   -- сколько монет в него вложено (кейс + корм) — для продажи
     )
 """)
 
@@ -1768,7 +1809,15 @@ AI_TECH_RULES = """Ответ показывается в Discord, поэтом�
 Грубость: если собеседник обращается к тебе с матом (в том числе замаскированным, например «х*й»),
 всерьёз оскорбляет тебя или других, или пишет пошлости и непотребства — не отвечай на это сообщение
 и не объясняй почему, а напиши ТОЛЬКО метку [ИГНОР]. Лёгкие шутки, «бака» и обычные вопросы о
-неприятных темах грубостью не считаются. Мат в контексте чата (не в самом вопросе к тебе) тоже не повод."""
+неприятных темах грубостью не считаются. Мат в контексте чата (не в самом вопросе к тебе) тоже не повод.
+Модерация: у тебя есть право давать участникам варны (предупреждения) и тайм-ауты. Если модератор просит
+наказать участника («дай варн», «кинь в тайм-аут», «замуть на час») — сделай это: ответь коротко в своём стиле
+и добавь в ответ метку, бот сам её выполнит и напишет итог:
+[ВАРН: id причина] · [ТАЙМАУТ: id минуты причина] · [СНЯТЬ_ТАЙМАУТ: id]
+id бери из списка «Упомянутые участники». Срок переводи в минуты (час = 60, день = 1440); не назвали — 10 минут.
+Причину пиши коротко своими словами. Есть ли у собеседника права модератора, тебе скажут перед вопросом:
+если прав нет — откажи в своём стиле и метку не ставь. Если непонятно, кого наказать (участник не упомянут), —
+переспроси. Сама, без просьбы модератора, метки не ставь никогда."""
 
 # Метка, которой ИИ сообщает "на это не отвечаю" (см. правило о грубости выше).
 IGNORE_TAG = re.compile(r"\[ИГНОР\]", re.IGNORECASE)
@@ -1982,10 +2031,11 @@ async def ai_generate(contents, system):
     raise last_error
 
 
-async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
+async def ask_ai(question, user, channel_id, guild_id, context="", images=None, targets=()):
     """Отправляет вопрос в Gemini вместе с памятью разговора и возвращает готовый текст ответа.
     question — текст вопроса, user — кто спрашивает, context — последние сообщения чата (необязательно),
-    images — список пар (байты картинки, формат) из download_images (необязательно)."""
+    images — список пар (байты картинки, формат) из download_images (необязательно),
+    targets — участники, о которых может идти речь (упомянутые, автор сообщения, на которое ответили)."""
     # Инструкция + сегодняшняя дата
     system = ai_system_prompt() + f"\nСегодня {datetime.date.today():%d.%m.%Y}."
 
@@ -1995,6 +2045,9 @@ async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
     prompt = current
     if context:
         prompt = f"Последние сообщения в чате (для контекста):\n{context}\n\nВопрос — {current}"
+    moderation = await mod_context(user, question, targets)  # права собеседника и id упомянутых — для варнов
+    if moderation:
+        prompt = f"{moderation}\n\n{prompt}"
     contents = [{"role": role, "parts": [{"text": text}]} for role, text in history_load(channel_id)]
     parts = [{"text": prompt}]
     for data, mime_type in images or []:  # картинки идут в том же сообщении, что и вопрос
@@ -2011,8 +2064,10 @@ async def ask_ai(question, user, channel_id, guild_id, context="", images=None):
         return None
 
     text = REMEMBER_TAG.sub("", text).strip()  # старая метка памяти, если вдруг появилась, — вырезаем
+    text, punishments = await run_mod_actions(text, user)  # варны и тайм-ауты по просьбе модератора
     if AI_ONE_LINE:
         text = to_one_line(text)  # склеиваем абзацы в одну строку (в памяти тоже — чтобы ИИ не копировал абзацы)
+    text = "\n".join([text] + punishments).strip() or "🤔 ИИ не дал ответа. Попробуй переформулировать вопрос."
 
     # Запоминаем этот обмен репликами. Сами картинки в память не сохраняются — только отметка о них.
     remembered_question = current + (f" [прислал картинок: {len(images)}]" if images else "")
@@ -2184,6 +2239,129 @@ async def punish_rudeness(member, channel):
             pass
 
 
+# ============================================================
+#  ВАРНЫ И ТАЙМ-АУТЫ ПО ПРОСЬБЕ МОДЕРАТОРА
+#  Модератор пишет боту «дай варн @Вася за спам» или «кинь @Петю в тайм-аут на час» — ИИ ставит в ответ
+#  метку, а бот её выполняет. Слушается бот только тех, у кого есть право «Отправлять участников подумать»
+#  (Moderate Members) или права администратора, и только против тех, чья роль ниже, чем у просящего.
+# ============================================================
+
+MOD_TAG = re.compile(r"\[\s*(ВАРН|ТАЙМ-?АУТ|СНЯТЬ[ _]ТАЙМ-?АУТ)\s*:\s*(\d+)\s*([^\]]*)\]", re.IGNORECASE)
+MENTION_ID = re.compile(r"<@!?(\d+)>")  # упоминание участника в тексте: <@123> или <@!123>
+AI_DEFAULT_TIMEOUT = 10                 # минут, если модератор не назвал срок
+MAX_MOD_ACTIONS = 3                     # больше наказаний за один ответ ИИ не выполняем
+
+
+def is_moderator(member):
+    """Может ли человек просить бота о варнах и тайм-аутах."""
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and not member.bot and (perms.moderate_members or perms.administrator))
+
+
+def outranks(moderator, target):
+    """Выше ли модератор по роли, чем тот, кого он хочет наказать (владельца сервера наказать нельзя)."""
+    guild = moderator.guild
+    if target.id == guild.owner_id:
+        return False
+    return moderator.id == guild.owner_id or moderator.top_role > target.top_role
+
+
+async def find_member(guild, user_id):
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)  # участника нет в памяти бота — спрашиваем Discord
+        except discord.HTTPException:
+            return None
+    return member
+
+
+async def mod_context(user, question, targets=()):
+    """Подсказка для ИИ: есть ли у собеседника права модератора и кого упомянули (с id)."""
+    guild = getattr(user, "guild", None)
+    if guild is None or not isinstance(user, discord.Member):
+        return ""
+    members = {m.id: m for m in targets if m.id != bot.user.id}
+    for user_id in MENTION_ID.findall(question):
+        if int(user_id) not in members and int(user_id) != bot.user.id:
+            member = await find_member(guild, int(user_id))
+            if member:
+                members[member.id] = member
+    if is_moderator(user):
+        text = f"{user.display_name} — модератор: может просить варны и тайм-ауты."
+    else:
+        text = f"Собеседник ({user.display_name}) без прав модератора: варны и тайм-ауты по его просьбе не выдавай."
+    if members:
+        text += "\nУпомянутые участники: " + ", ".join(f"{m.display_name} (id {m.id})" for m in members.values())
+    return text
+
+
+def add_warn(guild_id, user_id, moderator_id, reason):
+    """Записывает варн. Возвращает, сколько всего варнов у человека."""
+    db.execute("INSERT INTO warns (guild_id, user_id, moderator_id, reason, created) VALUES (?, ?, ?, ?, ?)",
+               (guild_id, user_id, moderator_id, reason, time.time()))
+    db.commit()
+    return db.execute("SELECT COUNT(*) FROM warns WHERE guild_id = ? AND user_id = ?",
+                      (guild_id, user_id)).fetchone()[0]
+
+
+async def run_mod_actions(text, user):
+    """Выполняет метки модерации из ответа ИИ. Возвращает (текст без меток, список строк с итогом)."""
+    actions = MOD_TAG.findall(text)
+    text = MOD_TAG.sub("", text).strip()
+    guild = getattr(user, "guild", None)
+    if not actions or guild is None:
+        return text, []
+    if not is_moderator(user):  # ИИ не должна была ставить метку — но на всякий случай проверяем сами
+        error_logger.warning("ИИ поставила метку наказания по просьбе не-модератора %s — не выполняю", user.id)
+        return text, []
+
+    results = []
+    for kind, target_id, rest in actions[:MAX_MOD_ACTIONS]:
+        kind = kind.upper().replace("-", "").replace(" ", "_")
+        target = await find_member(guild, int(target_id))
+        if target is None:
+            results.append("❓ Не нашла такого участника на сервере.")
+            continue
+        if target.bot:
+            results.append(f"🤖 {target.mention} — бот, ботов не наказываю.")
+            continue
+        if not outranks(user, target):
+            results.append(f"⛔ {target.mention} по роли не ниже тебя — наказать не могу.")
+            continue
+        rest = rest.strip()
+        try:
+            if kind == "ВАРН":
+                reason = rest or "без причины"
+                count = add_warn(guild.id, target.id, user.id, reason)
+                results.append(f"⚠️ {target.mention} получает варн №{count}: {reason}")
+            elif kind == "ТАЙМАУТ":
+                match = re.match(r"(\d+)\s*(.*)", rest)
+                minutes = int(match[1]) if match else AI_DEFAULT_TIMEOUT
+                reason = (match[2] if match else rest).strip() or "по просьбе модератора"
+                minutes = min(max(minutes, 1), 28 * 24 * 60)  # Discord: от 1 минуты до 28 дней
+                await target.timeout(datetime.timedelta(minutes=minutes),
+                                     reason=f"{reason} (попросил {user.display_name})")
+                results.append(f"🔇 {target.mention} в тайм-ауте на {minutes_text(minutes)}: {reason}")
+            else:  # СНЯТЬ_ТАЙМАУТ
+                await target.timeout(None, reason=f"Снять тайм-аут попросил {user.display_name}")
+                results.append(f"🔊 С {target.mention} снят тайм-аут.")
+        except discord.Forbidden:
+            results.append(f"⚠️ Не хватает прав, чтобы наказать {target.mention}: нужно право «Отправлять участников "
+                           f"подумать», и моя роль должна быть выше его роли.")
+        except Exception as error:
+            await report_error("Наказание по просьбе модератора", error, guild, user)
+            results.append(f"😵 Не получилось наказать {target.mention}.")
+
+    log_channel = log_channel_for(guild.id)
+    if log_channel and results:
+        try:
+            await log_channel.send(f"👮 По просьбе {user.mention}:\n" + "\n".join(results), allowed_mentions=NO_PINGS)
+        except Exception:
+            pass
+    return text, results
+
+
 async def ai_reply(message):
     """Отвечает с помощью ИИ на сообщение, в котором обратились к боту."""
     if is_rude(message.content):  # к боту обратились с матом — молчим (и не тратим запрос к Google)
@@ -2213,7 +2391,11 @@ async def ai_reply(message):
         except Exception:
             context = ""  # нет права читать историю канала — обойдёмся без контекста
         try:
-            answer = await ask_ai(question, message.author, message.channel.id, message.guild.id, context, images)
+            targets = [m for m in message.mentions if isinstance(m, discord.Member)]
+            if isinstance(replied, discord.Message) and isinstance(replied.author, discord.Member):
+                targets.append(replied.author)  # «дай ему варн» в ответ на чужое сообщение
+            answer = await ask_ai(question, message.author, message.channel.id, message.guild.id, context, images,
+                                  targets)
         except Exception as error:
             await report_error("ИИ (ответ на сообщение)", error, message.guild, message.author, message.channel)
             answer = ai_error_text(error)
@@ -2294,12 +2476,12 @@ def money_position(guild_id, balance):
     ).fetchone()[0] + 1
 
 
-async def take_bet(interaction, bet):
-    """Проверяет, хватает ли монет, и списывает ставку. Возвращает True, если ставка принята."""
+async def take_bet(interaction, bet, what="ставка"):
+    """Проверяет, хватает ли монет, и списывает ставку (или цену покупки — what="цена"). True — если списали."""
     balance, _ = get_wallet(interaction.guild.id, interaction.user)
     if bet > balance:
         await interaction.response.send_message(
-            f"Не хватает монет: у тебя {money_text(balance)}, а ставка — {money_text(bet)}. "
+            f"Не хватает монет: у тебя {money_text(balance)}, а {what} — {money_text(bet)}. "
             f"Заработать можно через /work.", ephemeral=True)
         return False
     add_money(interaction.guild.id, interaction.user, -bet)
@@ -2657,7 +2839,7 @@ async def make_daily_text(kind, guild=None):
         try:
             response = await ai_generate(task, ai_system_prompt() + f"\nСегодня {today:%d.%m.%Y}.")
             text = REMEMBER_TAG.sub("", response.text or "")  # на всякий случай убираем метки памяти...
-            text = IGNORE_TAG.sub("", text).strip()            # ...и метку "не отвечаю"
+            text = MOD_TAG.sub("", IGNORE_TAG.sub("", text)).strip()  # ...и метки "не отвечаю" и наказаний
             if text:
                 return text
         except Exception as error:
@@ -2756,7 +2938,7 @@ async def chatter_text(channel):
     text = (response.text or "").strip()
     if not text or IGNORE_TAG.search(text):
         return None
-    text = REMEMBER_TAG.sub("", text).strip()
+    text = MOD_TAG.sub("", REMEMBER_TAG.sub("", text)).strip()  # сама по себе никого не наказывает
     return to_one_line(text) if AI_ONE_LINE else text
 
 
@@ -3581,6 +3763,251 @@ async def blackjack(interaction: discord.Interaction, bet: app_commands.Range[in
     game.message = await interaction.original_response()  # запоминаем сообщение (для таймаута)
 
 
+# ============================================================
+#  ПИТОМЦЫ И КЕЙСЫ
+#  Питомцев выбивают из кейсов (/case). Каждый питомец сам приносит монеты в час — они копятся,
+#  забрать их — /pets_collect (копится не больше collect_cap_hours часов, так что заходи почаще).
+#  Питомец растёт, если его кормить (/pet_feed): каждый уровень даёт +25% к доходу.
+#  Ненужного питомца можно продать (/pet_sell) — вернётся часть вложенных монет.
+# ============================================================
+
+CASE_PRICE = max(1, setting("pets", "case_price", 1000))             # обычный кейс
+GOLD_CASE_PRICE = max(1, setting("pets", "gold_case_price", 5000))   # золотой кейс — без обычных питомцев
+MAX_PETS = max(1, setting("pets", "max_pets", 10))                   # сколько питомцев может быть у одного человека
+PET_MAX_LEVEL = max(1, setting("pets", "max_level", 20))
+PET_COLLECT_CAP = max(1, setting("pets", "collect_cap_hours", 24))  # доход копится не дольше N часов
+PET_SELL_PERCENT = min(max(setting("pets", "sell_percent", 50), 0), 100)  # сколько % вложенного вернёт продажа
+
+# Редкость: название, цвет карточки и шансы в обычном и золотом кейсе (в процентах).
+PET_RARITIES = {
+    "common":    {"name": "Обычный",     "color": 0x9CA3AF, "case": 60.0, "gold": 0.0},
+    "rare":      {"name": "Редкий",      "color": 0x3B82F6, "case": 28.0, "gold": 50.0},
+    "epic":      {"name": "Эпический",   "color": 0xA855F7, "case": 9.0,  "gold": 35.0},
+    "legendary": {"name": "Легендарный", "color": 0xF59E0B, "case": 2.7,  "gold": 12.0},
+    "mythic":    {"name": "Мифический",  "color": 0xEF4444, "case": 0.3,  "gold": 3.0},
+}
+
+# Виды питомцев: ключ → (эмодзи, имя, редкость, монет в час на 1 уровне)
+PET_SPECIES = {
+    "sergey":   ("🐶", "собачка Сергей",      "common",    10),
+    "valera":   ("🐱", "котик Валера",        "common",    10),
+    "gena":     ("🐹", "хомяк Геннадий",      "common",    12),
+    "tolik":    ("🐦", "голубь Толик",        "common",    8),
+    "arkady":   ("🦊", "лис Аркадий",         "rare",      25),
+    "tamara":   ("🦉", "сова Тамара",         "rare",      25),
+    "boris":    ("🐢", "черепаха Борис",      "rare",      22),
+    "igor":     ("🐺", "волк Игорь",          "epic",      60),
+    "edik":     ("🐧", "пингвин Эдуард",      "epic",      55),
+    "zhorik":   ("🦝", "енот Жорик",          "epic",      65),
+    "vasily":   ("🐉", "дракон Василий",      "legendary", 150),
+    "lyudmila": ("🦄", "единорог Людмила",    "legendary", 140),
+    "schrod":   ("🐈‍⬛", "кот Шрёдингера",      "mythic",    400),
+}
+
+PET_STAGES = [(1, "малыш"), (5, "подросток"), (10, "взрослый"), (15, "легенда района")]  # с какого уровня какая стадия
+
+
+def pet_stage(level):
+    stage = PET_STAGES[0][1]
+    for start, name in PET_STAGES:
+        if level >= start:
+            stage = name
+    return stage
+
+
+def pet_income(species, level):
+    """Монет в час у питомца этого вида и уровня."""
+    return round(PET_SPECIES[species][3] * (1 + 0.25 * (level - 1)))
+
+
+def pet_feed_cost(species, level):
+    """Сколько стоит покормить питомца, чтобы он вырос с level до level + 1."""
+    return PET_SPECIES[species][3] * 20 * level
+
+
+def pet_title(species, level=None):
+    emoji, name, rarity, _ = PET_SPECIES[species]
+    text = f"{emoji} {name}"
+    return text + (f" (ур. {level}, {pet_stage(level)})" if level else "")
+
+
+def pet_pending(species, level, last_collect, now=None):
+    """Сколько монет питомец накопил с последнего сбора (не больше, чем за PET_COLLECT_CAP часов)."""
+    hours = min(max(((now or time.time()) - last_collect) / 3600, 0), PET_COLLECT_CAP)
+    return int(pet_income(species, level) * hours)
+
+
+def user_pets(guild_id, user_id):
+    """Питомцы человека по порядку: список (id, species, level, last_collect, spent)."""
+    return db.execute("SELECT id, species, level, last_collect, spent FROM pets "
+                      "WHERE guild_id = ? AND user_id = ? ORDER BY id", (guild_id, user_id)).fetchall()
+
+
+def roll_pet(case_kind):
+    """Случайный вид питомца из кейса: сначала редкость по шансам, потом вид внутри редкости."""
+    rarities = [r for r in PET_RARITIES if PET_RARITIES[r][case_kind] > 0]
+    rarity = random.choices(rarities, weights=[PET_RARITIES[r][case_kind] for r in rarities])[0]
+    return random.choice([key for key, (_, _, r, _) in PET_SPECIES.items() if r == rarity])
+
+
+async def pet_autocomplete(interaction: discord.Interaction, current: str):
+    """Подсказки в поле «питомец»: список своих питомцев."""
+    choices = []
+    for number_, (pet_id, species, level, _, _) in enumerate(user_pets(interaction.guild_id, interaction.user.id), 1):
+        label = f"{number_}. {pet_title(species, level)}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=pet_id))
+    return choices[:25]
+
+
+def own_pet(interaction, pet_id):
+    """Питомец по id, только если он принадлежит вызвавшему. (id, species, level, last_collect, spent) или None."""
+    return db.execute("SELECT id, species, level, last_collect, spent FROM pets "
+                      "WHERE id = ? AND guild_id = ? AND user_id = ?",
+                      (pet_id, interaction.guild_id, interaction.user.id)).fetchone()
+
+
+@bot.tree.command(name="case", description=f"Открыть кейс с питомцем (обычный — {CASE_PRICE}, золотой — {GOLD_CASE_PRICE} монет)")
+@app_commands.describe(kind="Какой кейс открыть")
+@app_commands.choices(kind=[
+    app_commands.Choice(name=f"📦 Обычный — {CASE_PRICE} монет", value="case"),
+    app_commands.Choice(name=f"🎁 Золотой — {GOLD_CASE_PRICE} монет (без обычных питомцев)", value="gold"),
+])
+@app_commands.guild_only()
+async def open_case(interaction: discord.Interaction, kind: app_commands.Choice[str]):
+    price = CASE_PRICE if kind.value == "case" else GOLD_CASE_PRICE
+    if len(user_pets(interaction.guild_id, interaction.user.id)) >= MAX_PETS:
+        await interaction.response.send_message(
+            f"🏠 У тебя уже {MAX_PETS} питомцев — больше не поместится. Продай кого-нибудь: /pet_sell", ephemeral=True)
+        return
+    if not await take_bet(interaction, price, "цена кейса"):  # не хватает монет — take_bet сам скажет
+        return
+
+    species = roll_pet(kind.value)
+    emoji, name, rarity, _ = PET_SPECIES[species]
+    db.execute("INSERT INTO pets (guild_id, user_id, species, level, last_collect, spent) VALUES (?, ?, ?, 1, ?, ?)",
+               (interaction.guild_id, interaction.user.id, species, time.time(), price))
+    db.commit()
+
+    box = "📦" if kind.value == "case" else "🎁"
+    await interaction.response.send_message(f"{box} {interaction.user.mention} открывает кейс...",
+                                            allowed_mentions=NO_PINGS)
+    await asyncio.sleep(2)  # немного интриги
+    info = PET_RARITIES[rarity]
+    embed = discord.Embed(color=info["color"], title=f"{emoji} {name}",
+                          description=f"**{info['name']}** питомец!\nПриносит **{money_text(pet_income(species, 1))} в час**.")
+    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+    embed.set_footer(text="Забрать доход — /pets_collect · вырастить — /pet_feed")
+    await interaction.edit_original_response(content=None, embed=embed)
+
+
+@bot.tree.command(name="cases", description="Какие питомцы бывают в кейсах и с каким шансом")
+async def show_cases(interaction: discord.Interaction):
+    lines = []
+    for rarity, info in PET_RARITIES.items():
+        pets = ", ".join(f"{e} {n} ({money_text(income)}/ч)" for e, n, r, income in PET_SPECIES.values() if r == rarity)
+        lines.append(f"**{info['name']}** — обычный кейс {info['case']:g}%, золотой {info['gold']:g}%\n{pets}")
+    embed = discord.Embed(color=0x8B5CF6, title="🎁 Кейсы с питомцами", description="\n\n".join(lines))
+    embed.set_footer(text=f"Обычный кейс — {CASE_PRICE}, золотой — {GOLD_CASE_PRICE} монет. "
+                          f"Каждый уровень питомца: +25% к доходу.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="pets", description="Посмотреть питомцев и сколько они накопили")
+@app_commands.describe(member="Чьих питомцев посмотреть (если не выбрать — твоих)")
+@app_commands.guild_only()
+async def show_pets(interaction: discord.Interaction, member: discord.Member | None = None):
+    member = member or interaction.user
+    pets = user_pets(interaction.guild_id, member.id)
+    if not pets:
+        text = "Питомцев пока нет. Открой кейс: /case" if member == interaction.user else "У него пока нет питомцев."
+        await interaction.response.send_message(f"🐾 {text}", ephemeral=True)
+        return
+    now = time.time()
+    lines, total_income, total_pending = [], 0, 0
+    for number_, (_, species, level, last_collect, _) in enumerate(pets, 1):
+        income, pending = pet_income(species, level), pet_pending(species, level, last_collect, now)
+        total_income += income
+        total_pending += pending
+        lines.append(f"`{number_}.` {pet_title(species, level)} — {money_text(income)}/ч, накопил {number(pending)}")
+    embed = discord.Embed(color=0x22C55E, title=f"🐾 Питомцы {member.display_name} ({len(pets)}/{MAX_PETS})",
+                          description="\n".join(lines))
+    embed.add_field(name="Доход", value=f"{money_text(total_income)} в час")
+    embed.add_field(name="Можно забрать", value=money_text(total_pending))
+    embed.set_footer(text=f"Доход копится до {hours_text(PET_COLLECT_CAP * 3600)} — потом питомцы ждут, пока заберёшь")
+    await interaction.response.send_message(embed=embed, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="pets_collect", description="Забрать монеты, которые заработали питомцы")
+@app_commands.guild_only()
+async def pets_collect(interaction: discord.Interaction):
+    pets = user_pets(interaction.guild_id, interaction.user.id)
+    if not pets:
+        await interaction.response.send_message("🐾 Питомцев пока нет. Открой кейс: /case", ephemeral=True)
+        return
+    now = time.time()
+    total = sum(pet_pending(species, level, last_collect, now) for _, species, level, last_collect, _ in pets)
+    if total <= 0:
+        await interaction.response.send_message("⏳ Питомцы ещё ничего не накопили — загляни попозже.", ephemeral=True)
+        return
+    db.execute("UPDATE pets SET last_collect = ? WHERE guild_id = ? AND user_id = ?",
+               (now, interaction.guild_id, interaction.user.id))
+    balance = add_money(interaction.guild_id, interaction.user, total)  # add_money сохраняет и сбор тоже
+    await interaction.response.send_message(
+        f"🐾 Питомцы {interaction.user.mention} принесли **+{money_text(total)}**. Баланс: **{money_text(balance)}**.",
+        allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="pet_feed", description="Покормить питомца — он вырастет на уровень и станет приносить больше")
+@app_commands.describe(pet="Какого питомца покормить")
+@app_commands.autocomplete(pet=pet_autocomplete)
+@app_commands.guild_only()
+async def pet_feed(interaction: discord.Interaction, pet: int):
+    row = own_pet(interaction, pet)
+    if row is None:
+        await interaction.response.send_message("Такого питомца у тебя нет — выбери из списка.", ephemeral=True)
+        return
+    pet_id, species, level, last_collect, _ = row
+    if level >= PET_MAX_LEVEL:
+        await interaction.response.send_message(f"{pet_title(species, level)} уже вырос до максимума!", ephemeral=True)
+        return
+    cost = pet_feed_cost(species, level)
+    if not await take_bet(interaction, cost, "корм"):
+        return
+    # Что накопилось по старому доходу, не теряется: сдвигаем начало отсчёта так, чтобы сумма осталась прежней
+    now = time.time()
+    pending = pet_pending(species, level, last_collect, now)
+    new_income = pet_income(species, level + 1)
+    db.execute("UPDATE pets SET level = level + 1, spent = spent + ?, last_collect = ? WHERE id = ?",
+               (cost, now - pending / new_income * 3600, pet_id))
+    db.commit()
+    stage_up = pet_stage(level + 1) != pet_stage(level)
+    await interaction.response.send_message(
+        f"🍖 {interaction.user.mention} кормит {pet_title(species)} за {money_text(cost)} — "
+        f"теперь **ур. {level + 1}**{' и он стал **' + pet_stage(level + 1) + '**!' if stage_up else ''}. "
+        f"Доход: **{money_text(new_income)}/ч**"
+        + (f", следующая кормёжка — {money_text(pet_feed_cost(species, level + 1))}." if level + 1 < PET_MAX_LEVEL else "."),
+        allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="pet_sell", description=f"Продать питомца (вернётся {PET_SELL_PERCENT}% вложенных монет)")
+@app_commands.describe(pet="Какого питомца продать")
+@app_commands.autocomplete(pet=pet_autocomplete)
+@app_commands.guild_only()
+async def pet_sell(interaction: discord.Interaction, pet: int):
+    row = own_pet(interaction, pet)
+    if row is None:
+        await interaction.response.send_message("Такого питомца у тебя нет — выбери из списка.", ephemeral=True)
+        return
+    pet_id, species, level, last_collect, spent = row
+    price = spent * PET_SELL_PERCENT // 100 + pet_pending(species, level, last_collect)  # и накопленное тоже
+    db.execute("DELETE FROM pets WHERE id = ?", (pet_id,))
+    balance = add_money(interaction.guild_id, interaction.user, price)
+    await interaction.response.send_message(
+        f"💸 {interaction.user.mention} продаёт {pet_title(species, level)} за **{money_text(price)}**. "
+        f"Баланс: **{money_text(balance)}**.", allowed_mentions=NO_PINGS)
+
+
 # ---------- Утренние и вечерние сообщения ----------
 
 @bot.tree.command(name="daily_setup", description="Включить утренние и вечерние сообщения")
@@ -3722,6 +4149,38 @@ async def set_log_channel(interaction: discord.Interaction, channel: discord.Tex
     db.commit()
     await interaction.response.send_message(
         f"✅ Теперь присылаю ошибки в {channel.mention}. Выключить — /log_channel без канала.", ephemeral=True)
+
+
+@bot.tree.command(name="warns", description="Варны участника (их выдаёт бот по просьбе модератора)")
+@app_commands.describe(member="Чьи варны посмотреть (если не выбрать — твои)")
+@app_commands.guild_only()
+async def show_warns(interaction: discord.Interaction, member: discord.Member | None = None):
+    member = member or interaction.user
+    rows = db.execute("SELECT moderator_id, reason, created FROM warns WHERE guild_id = ? AND user_id = ? "
+                      "ORDER BY id DESC LIMIT 10", (interaction.guild_id, member.id)).fetchall()
+    total = db.execute("SELECT COUNT(*) FROM warns WHERE guild_id = ? AND user_id = ?",
+                       (interaction.guild_id, member.id)).fetchone()[0]
+    if not rows:
+        await interaction.response.send_message(f"✅ У {member.mention} нет варнов.", allowed_mentions=NO_PINGS)
+        return
+    lines = [f"• <t:{int(created)}:d> — {reason} (выдал <@{moderator_id}>)" for moderator_id, reason, created in rows]
+    embed = discord.Embed(color=0xF59E0B, title=f"⚠️ Варны {member.display_name}: {total}", description="\n".join(lines))
+    if total > len(rows):
+        embed.set_footer(text=f"Показаны последние {len(rows)}")
+    await interaction.response.send_message(embed=embed, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="warns_clear", description="Снять все варны с участника")
+@app_commands.describe(member="С кого снять варны")
+@app_commands.default_permissions(moderate_members=True)  # команду видят только модераторы
+@app_commands.guild_only()
+async def warns_clear(interaction: discord.Interaction, member: discord.Member):
+    deleted = db.execute("DELETE FROM warns WHERE guild_id = ? AND user_id = ?",
+                         (interaction.guild_id, member.id)).rowcount
+    db.commit()
+    await interaction.response.send_message(
+        f"🧹 С {member.mention} сняты варны: {deleted}." if deleted else f"У {member.mention} и так нет варнов.",
+        allowed_mentions=NO_PINGS)
 
 
 @bot.tree.command(name="leave", description="Выйти из канала (очередь сохранится)")
