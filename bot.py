@@ -3,7 +3,7 @@
 #  Музыка:  /play, /skip, /pause, /resume, /queue, /remove_all, /setvolume, /leave, /top_chart_month
 #           (очередь хранится в базе и не пропадает после /leave и перезапуска)
 #  Уровни:  /rank, /leaderboard  (опыт за сообщения в чате и за время в голосовом канале)
-#  Разное:  /weather, /weather_cities, /dice, /roll, /divination, /pogonyalo
+#  Разное:  /weather, /weather_cities, /dice, /roll, /divination
 #  Игра:    /dick_growth, /dick_size, /dick_leaderboard
 #  Деньги:  /work, /balance, /give_money, /money_leaderboard, /coinflip, /slots, /blackjack
 #  Питомцы: /case (дешёвый, средний, дорогой), /cases, /pets, /pets_collect, /pet_feed, /pet_sell — питомцы из кейсов приносят монеты
@@ -85,14 +85,26 @@ DEFAULT_PROMPT_FILE = """# Характер ИИ-бота. Пиши обычны
 
 """ + DEFAULT_CHARACTER + "\n"
 
-DEFAULT_AUTO_REPLIES_FILE = """# Автоответы бота. Каждая строка: слово = ответ
-# Несколько слов через запятую:          привет, здарова = привет милый
+DEFAULT_AUTO_REPLIES_FILE = """# Автоответы бота. Каждая строка: слова = ответ
+# Несколько слов через запятую:                       привет, здарова = привет милый
 # Несколько ответов через | (бот выберет случайный):  даня = это который сидит на красном стуле? | опять он
+# Звёздочка * — любые буквы на конце:                  дот* = сработает на «дота», «доту», «дотой»...
+# После || — ответ тем, кто недавно грубил боту:      привет = привет милый || иди нахуй
 # Строки, которые начинаются с #, — пояснения, бот их пропускает.
-# Большие и маленькие буквы не важны. После сохранения файла перезапускать бота не нужно.
+# Большие и маленькие буквы не важны, ё и е — тоже. Срабатывает первая подходящая строка сверху.
+# После сохранения файла перезапускать бота не нужно.
 
-привет = привет милый
-даня = это который сидит на красном стуле?
+доброе утро, доброго утра, утро доброе, утречко, добрутро = доброе милый | доброе утро милый
+спокойных снов, спокойной ночи, сладких снов, доброй ночи, споки, спок ноч = сладких снов милый
+привет, приветик, приветствую, здарова, здравствуй, хай, ку = привет милый || иди нахуй
+дота, доту, доты, доте, дотой, дотка, дотку, дотер, дотеры, дотеров, дотеру, дота2, dota, dota2, доту2 = иди нахуй со своей дотой
+даня, даню, дани, дане, даней, данёк, данька, даньку, данечка, данил, данила, данилу, даниле, данилой, даниил, даниила, даниилу, данчик, данёчек = это который на красном стуле сидит? | это который с 17 леткой встречается? | это который со школьницами встречается?
+рома, рому, ромы, роме, ромой, ромка, ромку, ромки, ромчик, ромочка, ромыч, ромаха, ромах = яйца под каблуком | встречается с фоидкой
+никита, никиту, никиты, никите, никитой, никитос, никитоса, никитосу, никитка, никитку, никиточка, никитосик, китос = воздухан
+олег, олега, олегу, олегом, олеге, олежа, олежу, олежка, олежку, олежек, олежик = бадалян что ли?
+максим, максима, максиму, максимом, максиме, макс, макса, максу, максом, максе, максимка, максимку, максик, максон, максончик = белый нигер
+саня, саню, сани, сане, саней, санёк, санька, саньку, санечка, санчо, санчес, саша, сашу, саши, саше, сашей, сашка, сашку, сашок, шура, шурик = 200
+ильяс, ильяса, ильясу, ильясом, ильясе, ильясик, ильясику, ильяска = латентный пидарас
 """
 
 DEFAULT_BAD_WORDS_FILE = """# Слова, на которые бот не отвечает: если к боту обратились с одним из них — ИИ промолчит.
@@ -188,7 +200,7 @@ growth_cooldown_hours = 24
 [channels]
 ; Команды, которые работают только в канале для игр (его выбирают в Discord командой /games_channel).
 ; Пиши названия через запятую. Пока канал не выбран, все команды работают везде.
-games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, divination, pogonyalo
+games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, divination
 
 [moderation]
 ; Тайм-ауты за грубость к боту (мат, оскорбления, непотребства). Первый раз бот просто молчит,
@@ -290,20 +302,31 @@ def ai_character():
     return cached_file(PROMPT_PATH, parse_prompt, "") or DEFAULT_CHARACTER
 
 
+LETTER = "[0-9a-zа-я]"  # "буква" для поиска слов (ё заранее заменяем на е)
+
+
 def parse_auto_replies(text):
-    """Строки «слово = ответ» → список пар (шаблон для поиска слова, варианты ответа)."""
+    """Строки «слова = ответы || ответы грубиянам» → список (шаблон, ответы, ответы тем, кто грубил боту)."""
     rules = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:  # пустые строки и пояснения пропускаем
             continue
         words, answers = line.split("=", 1)  # делим по первому «=»: слева слова, справа ответы
-        options = [answer.strip() for answer in answers.split("|") if answer.strip()]
+        nice, _, rude = answers.partition("||")  # после «||» — ответы тем, кто недавно грубил боту
+        options = [answer.strip() for answer in nice.split("|") if answer.strip()]
+        rude_options = [answer.strip() for answer in rude.split("|") if answer.strip()] or options
+        variants = []
         for word in words.split(","):
-            word = word.strip().lower()
-            if word and options:
-                # \b — граница слова: "привет" сработает в "привет всем", но не в "приветствую"
-                rules.append((re.compile(rf"\b{re.escape(word)}\b"), options))
+            word = word.strip().lower().replace("ё", "е")
+            if word:
+                # * в конце — любые буквы: "дот*" найдёт и "дота", и "дотой"
+                variants.append(re.escape(word.rstrip("*")) + (f"{LETTER}*" if word.endswith("*") else ""))
+        if variants and options:
+            # Граница слова с обеих сторон: "привет" сработает в "привет всем", но не в "приветствую",
+            # а "кит" — не в "никита". Все слова строки — в одном шаблоне.
+            pattern = re.compile(rf"(?<!{LETTER})(?:{'|'.join(variants)})(?!{LETTER})")
+            rules.append((pattern, options, rude_options))
     return rules
 
 
@@ -312,7 +335,6 @@ def auto_replies():
     return cached_file(AUTO_REPLIES_PATH, parse_auto_replies, [])
 
 
-LETTER = "[0-9a-zа-я]"  # "буква" для поиска плохих слов (ё заранее заменяем на е)
 
 
 def parse_bad_words(text):
@@ -342,7 +364,7 @@ def is_rude(text):
 DEFAULT_GAMES_COMMANDS = ("rank, leaderboard, top_chart_month, money_leaderboard, "
                           "dick_growth, dick_size, dick_leaderboard, work, balance, give_money, "
                           "coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, "
-                          "dice, roll, divination, pogonyalo")
+                          "dice, roll, divination")
 GAMES_COMMANDS = {name.strip().lstrip("/").lower()
                   for name in setting("channels", "games_commands", DEFAULT_GAMES_COMMANDS).split(",")
                   if name.strip()}
@@ -710,9 +732,12 @@ async def on_track_end(guild, text_channel):
 
 async def auto_reply(message):
     """Если в сообщении есть слово из config/auto_replies.txt — отвечает на него."""
-    text = message.content.lower()  # переводим в нижний регистр, чтобы "Привет" и "ПРИВЕТ" тоже срабатывали
-    for pattern, options in auto_replies():
+    # нижний регистр и ё → е, чтобы "Привет", "ПРИВЕТ" и "Санёк"/"Санек" срабатывали одинаково
+    text = message.content.lower().replace("ё", "е")
+    for pattern, options, rude_options in auto_replies():
         if pattern.search(text):
+            if rude_options is not options and was_rude_recently(message.guild.id, message.author.id):
+                options = rude_options  # человек недавно грубил боту — отвечаем ему по-другому
             # отвечаем цитатой, без пинга автора; NO_PINGS — даже если в ответе написать @everyone, никто не получит пинг
             await message.reply(random.choice(options), mention_author=False, allowed_mentions=NO_PINGS)
             return  # отвечаем только один раз, даже если в сообщении несколько слов
@@ -1737,25 +1762,6 @@ PREDICTIONS = {
     ]),
 }
 
-# Части для погоняла: прилагательное + титул + "чего?" (всё в мужском роде, чтобы слова сочетались)
-NICK_ADJECTIVES = ["Великий", "Сонный", "Легендарный", "Хитрый", "Голодный", "Таинственный",
-                   "Ленивый", "Бешеный", "Ночной", "Бронированный", "Неуловимый", "Грозный"]
-NICK_TITLES = ["повелитель", "король", "барон", "хранитель", "магистр", "пожиратель",
-               "князь", "император", "рыцарь", "шаман", "лорд", "генерал"]
-NICK_OBJECTS = ["пельменей", "подъезда", "дивана", "микроволновки", "голосовых", "мемов",
-                "холодильника", "носков", "дедлайнов", "шаурмы", "тапок", "вайфая",
-                "кринжа", "сессии", "пар", "доширака", "будильников", "сквозняков"]
-
-
-def daily_nickname(user_id):
-    """Погоняло на сегодня. У одного человека в течение дня оно не меняется, а завтра будет новое."""
-    today = datetime.date.today().isoformat()  # сегодняшняя дата, например "2026-10-30"
-    # random.Random(зерно) — генератор случайностей, который при одинаковом "зерне" выдаёт одно и то же.
-    # Зерно = id человека + дата, поэтому весь день результат одинаковый.
-    generator = random.Random(f"{user_id}-{today}")
-    return f"{generator.choice(NICK_ADJECTIVES)} {generator.choice(NICK_TITLES)} {generator.choice(NICK_OBJECTS)}"
-
-
 # ============================================================
 #  ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ (Google Gemini API)
 # ============================================================
@@ -2193,10 +2199,21 @@ def add_strike(guild_id, user_id):
 
 
 def reset_strikes(guild_id, user_id):
-    """Человек нормально обратился к боту — грубости больше не "подряд"."""
+    """Человек нормально обратился к боту — грубости больше не "подряд".
+    Время последней грубости остаётся — по нему автоответы помнят, что человек грубил (was_rude_recently)."""
     if guild_id:
-        db.execute("DELETE FROM rude_strikes WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        db.execute("UPDATE rude_strikes SET count = 0 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
         db.commit()
+
+
+RUDE_MEMORY_HOURS = 24  # сколько часов автоответы помнят, что человек грубил боту
+
+
+def was_rude_recently(guild_id, user_id):
+    """Грубил ли человек боту за последние RUDE_MEMORY_HOURS часов."""
+    row = db.execute("SELECT last_time FROM rude_strikes WHERE guild_id = ? AND user_id = ?",
+                     (guild_id, user_id)).fetchone()
+    return bool(row) and time.time() - row[0] < RUDE_MEMORY_HOURS * 3600
 
 
 async def punish_rudeness(member, channel):
@@ -3514,15 +3531,6 @@ async def divination(interaction: discord.Interaction, kind: app_commands.Choice
         text += f"❓ *{question}*\n"
     text += f"> {answer}"  # "> " — в Discord это оформление цитатой
     await interaction.response.send_message(text)
-
-
-@bot.tree.command(name="pogonyalo", description="Погоняло на сегодня")
-@app_commands.describe(member="Кому выдать погоняло (если не выбрать — тебе)")
-async def pogonyalo(interaction: discord.Interaction, member: discord.Member | None = None):
-    member = member or interaction.user
-    await interaction.response.send_message(
-        f"🏷️ Погоняло {member.mention} на сегодня: **{daily_nickname(member.id)}**"
-    )
 
 
 @bot.tree.command(name="dick_growth",
