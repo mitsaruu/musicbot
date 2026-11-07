@@ -128,6 +128,10 @@ fallback_model = gemini-3.8-flash
 retries = 2
 ; Склеивать ответ ИИ в одну строку, без абзацев: on или off (ответы с кодом не склеиваются)
 one_line_answers = on
+; Отвечать ли другим ботам, когда они пингуют бота или отвечают на его сообщение: on или off
+reply_to_bots = on
+; Сколько раз подряд в канале бот может ответить ботам, пока не напишет живой человек (защита от бесконечной переписки)
+bot_reply_limit = 3
 ; Сколько вопросов к ИИ может задать один человек за день
 daily_limit_per_user = 50
 ; Через сколько секунд можно задать следующий вопрос
@@ -2138,6 +2142,8 @@ async def punish_rudeness(member, channel):
     guild = getattr(member, "guild", None)
     if guild is None or not isinstance(member, discord.Member):  # в личных сообщениях тайм-аутов нет
         return
+    if member.bot:  # другим ботам тайм-ауты не даём — им достаточно того, что бот промолчал
+        return
     count = add_strike(guild.id, member.id)
     error_logger.info("Грубость к боту: пользователь=%s сервер=%s подряд=%s", member.id, guild.id, count)
     if count < 2 or not TIMEOUT_STEPS:  # первый раз — только молчим
@@ -2657,11 +2663,37 @@ async def before_chatter_loop():
     await bot.wait_until_ready()
 
 
+# --- Ответы другим ботам ---
+# Бот отвечает другому боту, только если тот прямо пингует его или отвечает на его сообщение,
+# и не больше BOT_REPLY_LIMIT раз подряд в канале — иначе два бота с ИИ переписывались бы бесконечно
+# (спам в чате и расход лимита Google). Счётчик обнуляется, когда в канал пишет живой человек.
+REPLY_TO_BOTS = setting("ai", "reply_to_bots", "on").lower() not in ("off", "нет", "no", "0")
+BOT_REPLY_LIMIT = max(setting("ai", "bot_reply_limit", 3), 0)
+bot_reply_streak = {}  # id канала → сколько раз подряд бот ответил ботам (после перезапуска — с нуля)
+
+
+async def bot_message(message):
+    """Сообщение от другого бота: опыт и автоответы ботам не положены, а на прямое обращение — ответ ИИ."""
+    if not (REPLY_TO_BOTS and ai_client and is_addressed_to_bot(message)):
+        return
+    streak = bot_reply_streak.get(message.channel.id, 0)
+    if streak >= BOT_REPLY_LIMIT:  # уже ответила ботам несколько раз подряд — молчим, пока не напишет человек
+        error_logger.info("Не отвечаю боту %s: лимит ответов ботам подряд в канале %s",
+                          message.author.id, message.channel.id)
+        return
+    bot_reply_streak[message.channel.id] = streak + 1
+    await ai_reply(message)
+
+
 @bot.event
 async def on_message(message):
     """Вызывается на каждое новое сообщение в любом канале, который видит бот."""
-    if message.author.bot or message.guild is None:  # не реагируем на ботов (и на себя) и на личные сообщения
+    if message.author == bot.user or message.guild is None:  # свои сообщения и личные сообщения пропускаем
         return
+    if message.author.bot:  # пишет другой бот
+        await bot_message(message)
+        return
+    bot_reply_streak.pop(message.channel.id, None)  # написал живой человек — счётчик ответов ботам с нуля
     last_activity[message.guild.id] = (message.channel.id, time.time())  # здесь сейчас общаются (для реплик)
     if ai_client and is_addressed_to_bot(message):  # к боту обратились — отвечает ИИ
         await ai_reply(message)
