@@ -3183,10 +3183,17 @@ async def setup_hook():
     chatter_loop.start()            # и случайные реплики по теме чата (раз в CHATTER_INTERVAL минут)
 
 
+patchnotes_done = False  # уже проверили патчноуты в этом запуске
+
+
 @bot.event
 async def on_ready():
     """Вызывается, когда бот успешно подключился к Discord."""
+    global patchnotes_done
     print(f"Бот запущен как {bot.user}")
+    if not patchnotes_done:  # on_ready бывает и после переподключения — патчноуты пишем один раз за запуск
+        patchnotes_done = True
+        await post_patchnotes()
 
 
 @bot.event
@@ -4906,6 +4913,131 @@ async def start_miniapp():
         print(f"Мини-приложение не запустилось: порт {MINIAPP_PORT} занят или недоступен ({error})")
         return
     print(f"Мини-приложение работает на http://{MINIAPP_HOST}:{MINIAPP_PORT} — пробрось его туннелем (см. README)")
+
+
+# ============================================================
+#  ПАТЧНОУТЫ
+#  Что нового — в файле patchnotes.txt (рядом с bot.py), новая запись сверху.
+#  После перезапуска бот сам публикует записи, которых ещё не было, в канал из /patchnotes_channel.
+# ============================================================
+PATCHNOTES_PATH = os.path.join(BASE_DIR, "patchnotes.txt")
+PATCHNOTES_MAX_AT_ONCE = 3  # если бот долго не перезапускали — публикуем не больше стольких записей разом
+
+db.execute("""
+    CREATE TABLE IF NOT EXISTS patchnotes_channel (
+        guild_id   INTEGER PRIMARY KEY,
+        channel_id INTEGER,
+        last_note  TEXT     -- номер последнего опубликованного патчноута, например "v5"
+    )
+""")
+db.commit()
+
+
+def parse_patchnotes(text):
+    """Текст patchnotes.txt → список записей (номер, дата, название, пункты), новая — первая."""
+    notes = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("## "):
+            parts = [part.strip() for part in line[3:].split("|")]
+            parts += [""] * (3 - len(parts))
+            notes.append({"id": parts[0], "date": parts[1], "title": parts[2], "items": []})
+        elif line and not line.startswith("#") and notes:
+            notes[-1]["items"].append(line.removeprefix("- ").removeprefix("• "))
+    return [note for note in notes if note["id"]]
+
+
+def patchnotes():
+    return cached_file(PATCHNOTES_PATH, parse_patchnotes, [])
+
+
+def patchnote_embed(note):
+    """Красивая карточка патчноута."""
+    embed = discord.Embed(title=f"📝 Обновление {note['id']}" + (f" — {note['title']}" if note["title"] else ""),
+                          description="\n".join(f"• {item}" for item in note["items"])[:4000] or "Мелкие исправления",
+                          color=0x7C6CF2)
+    if note["date"]:
+        embed.set_footer(text=note["date"])
+    return embed
+
+
+def patchnotes_channel_for(guild):
+    """(канал для патчноутов, номер последнего опубликованного) или (None, None)."""
+    row = db.execute("SELECT channel_id, last_note FROM patchnotes_channel WHERE guild_id = ?",
+                     (guild.id,)).fetchone()
+    return (guild.get_channel(row[0]), row[1]) if row else (None, None)
+
+
+def unpublished_notes(last_note):
+    """Записи новее last_note — от старой к новой. Если last_note в файле не нашёлся — только самая новая."""
+    notes = patchnotes()
+    ids = [note["id"] for note in notes]
+    fresh = notes[:ids.index(last_note)] if last_note in ids else notes[:1]
+    return list(reversed(fresh[:PATCHNOTES_MAX_AT_ONCE]))
+
+
+async def post_patchnotes():
+    """При запуске: на каждом сервере публикуем патчноуты, которых там ещё не было."""
+    for guild in bot.guilds:
+        channel, last_note = patchnotes_channel_for(guild)
+        if channel is None:
+            continue
+        for note in unpublished_notes(last_note):
+            try:
+                await channel.send(embed=patchnote_embed(note))
+            except discord.HTTPException as error:
+                await report_error("Патчноуты", error, guild, channel=channel)
+                break
+            db.execute("UPDATE patchnotes_channel SET last_note = ? WHERE guild_id = ?", (note["id"], guild.id))
+            db.commit()
+
+
+async def patchnote_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=f"{note['id']} — {note['title']}"[:100], value=note["id"])
+            for note in patchnotes() if current.lower() in f"{note['id']} {note['title']}".lower()][:25]
+
+
+@bot.tree.command(name="patchnotes", description="Что нового в боте: последний патчноут или любой прошлый")
+@app_commands.describe(version="Какой патчноут показать (если не выбрать — последний)")
+@app_commands.autocomplete(version=patchnote_autocomplete)
+async def show_patchnotes(interaction: discord.Interaction, version: str = None):
+    notes = patchnotes()
+    note = next((note for note in notes if note["id"] == version), None) if version else (notes[0] if notes else None)
+    if note is None:
+        await interaction.response.send_message("Такого патчноута нет.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=patchnote_embed(note), ephemeral=True)
+
+
+@bot.tree.command(name="patchnotes_channel",
+                  description="Канал, куда бот пишет патчноуты после обновлений (пусто — не писать)")
+@app_commands.describe(channel="Канал для патчноутов. Пусто — выключить")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def set_patchnotes_channel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+    if channel is None:
+        db.execute("DELETE FROM patchnotes_channel WHERE guild_id = ?", (interaction.guild.id,))
+        db.commit()
+        await interaction.response.send_message("✅ Больше не пишу патчноуты.", ephemeral=True)
+        return
+    permissions = channel.permissions_for(interaction.guild.me)
+    if not (permissions.view_channel and permissions.send_messages and permissions.embed_links):
+        await interaction.response.send_message(
+            f"Мне не хватает прав в {channel.mention}: нужны «Просматривать канал», «Отправлять сообщения» "
+            f"и «Встраивать ссылки».", ephemeral=True)
+        return
+    notes = patchnotes()
+    latest = notes[0] if notes else None
+    db.execute("""
+        INSERT INTO patchnotes_channel (guild_id, channel_id, last_note) VALUES (?, ?, ?)
+        ON CONFLICT (guild_id) DO UPDATE SET channel_id = excluded.channel_id, last_note = excluded.last_note
+    """, (interaction.guild.id, channel.id, latest["id"] if latest else None))
+    db.commit()
+    await interaction.response.send_message(
+        f"✅ Теперь после каждого обновления пишу патчноут в {channel.mention}. Выключить — /patchnotes_channel без канала.",
+        ephemeral=True)
+    if latest:
+        await channel.send(embed=patchnote_embed(latest))  # сразу показываем последний — чтобы было видно, как выглядит
 
 
 # Запуск бота. Эта строка "держит" программу работающей, пока её не остановят (Ctrl+C).
