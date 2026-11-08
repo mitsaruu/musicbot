@@ -90,13 +90,15 @@ DEFAULT_AUTO_REPLIES_FILE = """# Автоответы бота. Каждая с�
 # Несколько ответов через | (бот выберет случайный):  даня = это который сидит на красном стуле? | опять он
 # Звёздочка * — любые буквы на конце:                  дот* = сработает на «дота», «доту», «дотой»...
 # После || — ответ тем, кто недавно грубил боту:      привет = привет милый || иди нахуй
+# ~ в начале строки — приветствие: бот промолчит, если оно адресовано другому — в сообщении чьё-то имя,
+#   ник или упоминание («привет саня»). На свои имена (bot_names в settings.ini) бот отвечает всегда.
 # Строки, которые начинаются с #, — пояснения, бот их пропускает.
 # Большие и маленькие буквы не важны, ё и е — тоже. Срабатывает первая подходящая строка сверху.
 # После сохранения файла перезапускать бота не нужно.
 
-доброе утро, доброго утра, утро доброе, утречко, добрутро = доброе милый | доброе утро милый
-спокойных снов, спокойной ночи, сладких снов, доброй ночи, споки, спок ноч = сладких снов милый
-привет, приветик, приветствую, здарова, здравствуй, хай, ку = привет милый || иди нахуй
+~доброе утро, доброго утра, утро доброе, утречко, добрутро = доброе милый | доброе утро милый
+~спокойных снов, спокойной ночи, сладких снов, доброй ночи, споки, спок ноч = сладких снов милый
+~привет, приветик, приветствую, здарова, здравствуй, хай, ку = привет милый || иди нахуй
 дота, доту, доты, доте, дотой, дотка, дотку, дотер, дотеры, дотеров, дотеру, дота2, dota, dota2, доту2 = иди нахуй со своей дотой
 даня, даню, дани, дане, даней, данёк, данька, даньку, данечка, данил, данила, данилу, даниле, данилой, даниил, даниила, даниилу, данчик, данёчек = это который на красном стуле сидит? | это который с 17 леткой встречается? | это который со школьницами встречается?
 рома, рому, ромы, роме, ромой, ромка, ромку, ромки, ромчик, ромочка, ромыч, ромаха, ромах = яйца под каблуком | встречается с фоидкой
@@ -212,6 +214,11 @@ strike_reset_minutes = 60
 ; Писать ли в чат, что человек получил тайм-аут: on или off
 announce_timeouts = on
 
+[names]
+; Как зовут бота в чате (через запятую). На приветствие с этими именами («привет малфоид») бот отвечает,
+; а на приветствие с чужим именем или ником («привет саня») — молчит. Имя и ник бота в Discord добавятся сами.
+bot_names = малфоид, малфойд, малфой, malfoid, maldoid, malfoy, hallaan, hallan, халлаан, халлан, халаан
+
 [chatter]
 ; Иногда бот сам пишет в чат короткую реплику по теме разговора (в канал, где недавно общались).
 ; Раз в interval_minutes минут — с шансом chance_percent процентов. 0 — выключить.
@@ -306,13 +313,15 @@ LETTER = "[0-9a-zа-я]"  # "буква" для поиска слов (ё зар
 
 
 def parse_auto_replies(text):
-    """Строки «слова = ответы || ответы грубиянам» → список (шаблон, ответы, ответы тем, кто грубил боту)."""
+    """Строки «слова = ответы || ответы грубиянам» → список
+    (шаблон, ответы, ответы тем, кто грубил боту, приветствие ли это — строка с ~)."""
     rules = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:  # пустые строки и пояснения пропускаем
             continue
-        words, answers = line.split("=", 1)  # делим по первому «=»: слева слова, справа ответы
+        greeting = line.startswith("~")  # приветствие: не отвечаем, если оно адресовано другому
+        words, answers = line.lstrip("~").split("=", 1)  # делим по первому «=»: слева слова, справа ответы
         nice, _, rude = answers.partition("||")  # после «||» — ответы тем, кто недавно грубил боту
         options = [answer.strip() for answer in nice.split("|") if answer.strip()]
         rude_options = [answer.strip() for answer in rude.split("|") if answer.strip()] or options
@@ -326,7 +335,7 @@ def parse_auto_replies(text):
             # Граница слова с обеих сторон: "привет" сработает в "привет всем", но не в "приветствую",
             # а "кит" — не в "никита". Все слова строки — в одном шаблоне.
             pattern = re.compile(rf"(?<!{LETTER})(?:{'|'.join(variants)})(?!{LETTER})")
-            rules.append((pattern, options, rude_options))
+            rules.append((pattern, options, rude_options, greeting))
     return rules
 
 
@@ -730,12 +739,71 @@ async def on_track_end(guild, text_channel):
 
 # Сами пары «слово = ответ» лежат в файле config/auto_replies.txt (см. начало файла).
 
+# ---------- Кому адресовано приветствие ----------
+# «привет» — боту можно ответить; «привет саня» — это не боту, молчим; «привет малфоид» — боту, отвечаем.
+WORD = re.compile(LETTER + "+")  # одно слово (только буквы и цифры)
+BOT_NAMES = [name.strip().lower().replace("ё", "е")
+             for name in setting("names", "bot_names", "малфоид, malfoid, maldoid, hallaan, халлаан").split(",")
+             if name.strip()]
+known_names = {}  # сервер → имена и ники тех, кто писал в чат (у бота нет списка всех участников сервера)
+
+
+def name_words(name):
+    """«Kirill_228 (Кирюха)» → {"kirill", "кирюха"}: слова из имени длиной от 3 букв."""
+    return {word for word in WORD.findall((name or "").lower().replace("ё", "е")) if len(word) >= 3}
+
+
+def remember_names(member):
+    """Запоминаем имя, ник и глобальное имя автора сообщения — чтобы узнавать их в приветствиях."""
+    words = known_names.setdefault(member.guild.id, set())
+    for name in (member.name, getattr(member, "global_name", None), member.display_name):
+        words |= name_words(name)
+
+
+def word_is_name(word, names):
+    """Похоже ли слово на одно из имён, с учётом окончаний: «саню», «кириллу», «малфоиду»."""
+    for name in names:
+        stem = name if len(name) < 4 else name[:-1]  # отрезаем последнюю букву: «кирилл» → «кирил», «вова» → «вов»
+        if word.startswith(stem) and len(word) - len(stem) <= 3:
+            return True
+    return False
+
+
+def greeting_for_someone_else(message, text, rules):
+    """Приветствие адресовано кому-то другому, а не боту?"""
+    me = message.guild.me
+    bot_names = set(BOT_NAMES)
+    for name in (bot.user.name, getattr(bot.user, "global_name", None), getattr(me, "display_name", None)):
+        bot_names |= name_words(name)
+    words = WORD.findall(text)
+    if any(word_is_name(word, bot_names) for word in words) or any(name in text for name in BOT_NAMES if " " in name):
+        return False  # позвали бота по имени — отвечаем
+    if any(member != bot.user for member in message.mentions) or message.role_mentions:
+        return True   # «привет @Саня»
+    replied = message.reference.resolved if message.reference else None
+    if isinstance(replied, discord.Message) and replied.author != bot.user:
+        return True   # «привет» в ответ на чужое сообщение
+    # Чьё-то имя: слова из других автоответов (саня, даня...) или имя/ник кого-то с сервера
+    if any(pattern.search(text) for pattern, _, _, greeting in rules if not greeting):
+        return True
+    others = set(known_names.get(message.guild.id, set()))
+    for member in message.guild.members:  # участники, о которых бот знает
+        if not member.bot:
+            others |= name_words(member.name) | name_words(member.display_name)
+    others -= name_words(message.author.name) | name_words(message.author.display_name)  # своё имя не в счёт
+    others -= bot_names
+    return any(word_is_name(word, others) for word in words)
+
+
 async def auto_reply(message):
     """Если в сообщении есть слово из config/auto_replies.txt — отвечает на него."""
     # нижний регистр и ё → е, чтобы "Привет", "ПРИВЕТ" и "Санёк"/"Санек" срабатывали одинаково
     text = message.content.lower().replace("ё", "е")
-    for pattern, options, rude_options in auto_replies():
+    rules = auto_replies()
+    for pattern, options, rude_options, greeting in rules:
         if pattern.search(text):
+            if greeting and greeting_for_someone_else(message, text, rules):
+                continue  # «привет саня» — здороваются не с ботом, приветствие пропускаем
             if rude_options is not options and was_rude_recently(message.guild.id, message.author.id):
                 options = rude_options  # человек недавно грубил боту — отвечаем ему по-другому
             # отвечаем цитатой, без пинга автора; NO_PINGS — даже если в ответе написать @everyone, никто не получит пинг
@@ -3061,6 +3129,8 @@ async def on_message(message):
         await bot_message(message)
         return
     bot_reply_streak.pop(message.channel.id, None)  # написал живой человек — счётчик ответов ботам с нуля
+    if isinstance(message.author, discord.Member):
+        remember_names(message.author)  # чтобы узнавать его имя в чужих приветствиях («привет саня»)
     last_activity[message.guild.id] = (message.channel.id, time.time())  # здесь сейчас общаются (для реплик)
     if ai_client and is_addressed_to_bot(message):  # к боту обратились — отвечает ИИ
         await ai_reply(message)
