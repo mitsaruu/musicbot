@@ -1,0 +1,45 @@
+# Слова для игры Wortjagd (/wort) — немецкие слова ровно из 5 букв.
+# Пиши по одному или несколько через пробел/запятую, регистр не важен. Можно ä, ö, ü; слова с ß не подходят.
+# Из этого списка бот загадывает слово дня и слова для тренировки. Файл перечитывается сам — перезапуск не нужен.
+# Если в settings.ini ([wortspiel] only_known_words = on) — принимаются только догадки из этого списка.
+
+# --- Существительные ---
+abend acker adler ahorn aktie alarm album alpen alter ampel amsel angel angst anker anzug apfel april armee
+asche atlas augen autor bauch bauer bäume beere beine biber biene birne blase blatt blech blick blitz blume
+bluse boden bogen bohne boote börse brand braut brief brise brust buche bühne busch chaos chips clown couch
+dachs damen dampf decke degen deich diebe dinge dolch draht drama dreck druck duell dunst durst ebene eiche
+eimer eisen engel enkel erbse ernte eulen fabel faden fahne falke falle farbe fasan faser feder feier feind
+ferne feuer figur firma fisch flöte fluch fluss folie forst frage frist frost fuchs funke gabel gasse geist
+glück gnade grube grund gruft gummi gurke haare hafen hagel haken halle hände hasen haube haupt hecke heide
+henne herde hilfe hirte hitze hobel höhle honig hosen hotel hügel hunde hütte index insel jacke jäger juwel
+kabel käfer kakao kälte kamel kamin kampf kanal kanne kante kappe karte kasse kater katze kegel kehle kelch
+kerze kette keule kiste kleid klang klima knabe knall knopf koala kobra kohle komet könig kopie kraft krähe
+krake kranz kraut krebs kreis kreuz krieg krone kugel kunde kunst kurve küste lachs laden lager lampe lanze
+laune leben leder leere lehre leine leser licht liebe lilie linie linse liste liter löwen luchs lücke lunge
+macht magen maler mango marke markt maske masse mauer mäuse meise menge messe meter miete milch minze mönch
+moral motor mücke mühle mulde mumie musik mütze nabel nacht nadel nagel narbe natur nebel neffe nelke nonne
+nudel ochse onkel opfer orden organ otter paket palme panne papst party pasta pause perle pfahl pfand pfeil
+pferd pflug pfote piano pilot pilze pirat pizza plage platz pokal preis prinz probe puder puppe qualm quark
+quote radio rampe rasen rasse ratte raupe recht regal regel regen reich reihe reise rente rinde rinne rippe
+robbe rolle rosen ruder ruine runde sache sahne saite salat salbe samen sauna säule schaf schal schuh sechs
+segel seife seite senke serie silbe skala socke sonne sorge sorte speck spiel spion sport spott staat stadt
+stahl stall stamm stand start staub stein stern stich stiel stier stift stirn stock stoff stolz stroh stube
+stuhl stück stufe sturm sumpf suppe szene tafel tante tanne tasse taste taube teich tempo thema tiger tinte
+tisch titel toast tonne torte traum trend treue trieb tritt trost tulpe union vater vogel vokal waage wache
+waffe wagen waise walze wange wanne wanze waren wärme watte weide weile welle welpe wende werft wesen weste
+wette wiege wiese wille wolke wolle wunde wurst würze wüste zange zebra zecke zeile zelle ziege zitat zunge
+zweig zwerg
+
+# --- Глаголы ---
+atmen baden bauen beten ehren eilen enden erben essen fegen geben gehen haben heben holen hören irren jagen
+kauen legen lesen loben lösen lügen mähen malen mögen nagen nähen raten reden rufen sagen sägen
+sehen töten weben wehen
+
+# --- Прилагательные ---
+bange blank blass blind blond braun breit eigen eitel ernst flach flink frech fremd genau glatt grell klein
+knapp krank krass krumm leise mager milde mutig nackt nobel offen platt plump prima rasch rosig ruhig sanft
+sauer schön starr stark steif steil still stumm übrig vital weich weise
+
+# --- Другие слова ---
+bevor bitte damit daran darum dabei davon durch etwas heute immer jeder jetzt keine links nicht schon sonst
+statt trotz unten unter viele wegen warum wohin woher zwölf

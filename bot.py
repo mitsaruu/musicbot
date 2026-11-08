@@ -202,7 +202,7 @@ growth_cooldown_hours = 24
 [channels]
 ; Команды, которые работают только в канале для игр (его выбирают в Discord командой /games_channel).
 ; Пиши названия через запятую. Пока канал не выбран, все команды работают везде.
-games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, predskazanie, shar
+games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, predskazanie, shar, wort
 
 [moderation]
 ; Тайм-ауты за грубость к боту (мат, оскорбления, непотребства). Первый раз бот просто молчит,
@@ -213,6 +213,24 @@ timeouts = 1, 5, 10, 30, 60
 strike_reset_minutes = 60
 ; Писать ли в чат, что человек получил тайм-аут: on или off
 announce_timeouts = on
+
+[wortspiel]
+; Игра Wortjagd (/wort): угадать немецкое слово из 5 букв за 6 попыток. Слова — в config/german_words.txt.
+; Монеты за отгаданное слово дня: с 1-й попытки, со 2-й ... с 6-й (тренировка без награды)
+rewards = 500, 350, 250, 150, 100, 50
+; on — принимать только слова из german_words.txt; off — любое слово из 5 букв
+only_known_words = off
+; По какому часовому поясу наступает новый день (и новое слово дня)
+timezone = Europe/Berlin
+; Писать ли в чат, кто играет, итоги вчерашнего дня с серией дней и итог каждой партии (без слова): on или off
+announce = on
+
+[miniapp]
+; Мини-приложение Discord (Activity) для /wort. Работает, если в start.bat есть DISCORD_CLIENT_SECRET.
+; Веб-сервер слушает этот адрес и порт — до него Discord достучится через туннель (см. README).
+; port = 0 — выключить мини-приложение (тогда /wort играет прямо в чате)
+host = 127.0.0.1
+port = 8080
 
 [names]
 ; Как зовут бота в чате (через запятую). На приветствие с этими именами («привет малфоид») бот отвечает,
@@ -373,7 +391,7 @@ def is_rude(text):
 DEFAULT_GAMES_COMMANDS = ("rank, leaderboard, top_chart_month, money_leaderboard, "
                           "dick_growth, dick_size, dick_leaderboard, work, balance, give_money, "
                           "coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, "
-                          "dice, roll, predskazanie, shar")
+                          "dice, roll, predskazanie, shar, wort")
 GAMES_COMMANDS = {name.strip().lstrip("/").lower()
                   for name in setting("channels", "games_commands", DEFAULT_GAMES_COMMANDS).split(",")
                   if name.strip()}
@@ -3139,11 +3157,27 @@ async def on_message(message):
     await add_xp(message)          # опыт за сообщение
 
 
+async def sync_commands():
+    """Отправляет список наших команд в Discord. Возвращает, сколько команд зарегистрировано."""
+    try:
+        return len(await bot.tree.sync())
+    except discord.HTTPException as error:
+        if error.code != 50240:
+            raise
+    # Ошибка 50240: в Developer Portal включены Activities, и у приложения есть команда-«точка входа»
+    # (кнопка запуска мини-приложения). Discord не даёт её удалить — отправляем её вместе с нашими командами.
+    app_id = bot.application_id
+    entry_points = [command for command in await bot.http.get_global_commands(app_id) if command.get("type") == 4]
+    payload = [command.to_dict(bot.tree) for command in bot.tree._get_all_commands()] + entry_points
+    return len(await bot.http.bulk_upsert_global_commands(app_id, payload=payload)) - len(entry_points)
+
+
 @bot.event
 async def setup_hook():
     """Вызывается при запуске бота, до подключения. Здесь регистрируем слэш-команды."""
-    synced = await bot.tree.sync()  # отправляем список наших команд в Discord
-    print(f"Зарегистрировано слэш-команд: {len(synced)}")
+    synced = await sync_commands()  # отправляем список наших команд в Discord
+    print(f"Зарегистрировано слэш-команд: {synced}")
+    await start_miniapp()           # веб-сервер мини-приложения Wortjagd (если настроено)
     voice_xp_loop.start()           # запускаем начисление опыта за голосовые каналы (раз в минуту)
     daily_loop.start()              # и проверку утренних/вечерних сообщений (раз в минуту)
     chatter_loop.start()            # и случайные реплики по теме чата (раз в CHATTER_INTERVAL минут)
@@ -4344,6 +4378,534 @@ async def leave(interaction: discord.Interaction):
     if saved:
         text += f" Очередь сохранена ({saved} {plural(saved, 'трек', 'трека', 'треков')}) — продолжить: /resume"
     await interaction.followup.send(text)
+
+
+# ============================================================
+#  WORTJAGD — угадай немецкое слово из 5 букв (/wort)
+#  У каждого 6 попыток. После каждой догадки буквы подсвечиваются:
+#  🟢 — буква на своём месте, 🟡 — буква есть в слове, но в другом месте, ⚫ — такой буквы нет.
+#  Слово дня — одно на весь сервер, за победу дают монеты (чем быстрее, тем больше), сыграть — раз в день.
+#  Тренировка — случайные слова без награды, сколько угодно.
+#  Играть можно в мини-приложении Discord (Activity — открывается прямо в Discord) или прямо в чате.
+#  Слова — в config/german_words.txt, награды и прочее — в settings.ini, разделы [wortspiel] и [miniapp].
+# ============================================================
+import secrets  # случайные «пропуска» для мини-приложения, которые нельзя угадать
+from aiohttp import web  # маленький веб-сервер для мини-приложения (входит в aiohttp)
+
+WORDS_PATH = os.path.join(CONFIG_DIR, "german_words.txt")
+MINIAPP_PAGE = os.path.join(BASE_DIR, "miniapp", "index.html")  # страница мини-приложения
+WORD_LENGTH = 5
+MAX_GUESSES = 6
+GERMAN_LETTERS = set("abcdefghijklmnopqrstuvwxyzäöü")
+FALLBACK_WORDS = ["apfel", "blume", "brief", "feuer", "fisch", "katze", "kraft", "licht", "nacht", "sonne",
+                  "stein", "stern", "stuhl", "tisch", "traum", "vogel", "wagen", "wolke", "zunge", "zwerg"]
+WORD_MARKS = {"correct": "🟢", "present": "🟡", "absent": "⚫"}  # цвета букв в чате
+WORD_REWARDS = [int(value) for value in
+                re.findall(r"\d+", setting("wortspiel", "rewards", "500, 350, 250, 150, 100, 50"))] or [0]
+ONLY_KNOWN_WORDS = setting("wortspiel", "only_known_words", "off").lower() == "on"
+WORD_TIMEZONE = setting("wortspiel", "timezone", "Europe/Berlin")  # когда начинается новый день
+ANNOUNCE_WORD_RESULTS = setting("wortspiel", "announce", "on").lower() == "on"
+MINIAPP_HOST = setting("miniapp", "host", "127.0.0.1")
+MINIAPP_PORT = setting("miniapp", "port", 8080)
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")  # секрет приложения из Developer Portal → OAuth2
+MINIAPP_READY = bool(DISCORD_CLIENT_SECRET) and MINIAPP_PORT > 0
+
+db.execute("""
+    CREATE TABLE IF NOT EXISTS word_daily (
+        guild_id INTEGER,
+        user_id  INTEGER,
+        day      TEXT,      -- день, например "2026-11-08"
+        answer   TEXT,      -- загаданное слово (чтобы правка словаря не меняла начатую игру)
+        guesses  TEXT,      -- догадки через запятую
+        PRIMARY KEY (guild_id, user_id, day)
+    )
+""")
+db.commit()
+
+
+# Для каких дней на сервере уже написали итоги вчерашнего дня (чтобы не повторять после перезапуска)
+db.execute("""
+    CREATE TABLE IF NOT EXISTS word_summary (
+        guild_id INTEGER,
+        day      TEXT,
+        PRIMARY KEY (guild_id, day)
+    )
+""")
+db.commit()
+
+
+def parse_words(text):
+    """Текст файла со словами → список слов из 5 немецких букв без повторов."""
+    words = []
+    for line in text.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        for word in re.split(r"[\s,;]+", line.lower()):
+            if len(word) == WORD_LENGTH and set(word) <= GERMAN_LETTERS and word not in words:
+                words.append(word)
+    return words or FALLBACK_WORDS
+
+
+def german_words():
+    return cached_file(WORDS_PATH, parse_words, FALLBACK_WORDS)
+
+
+def word_today():
+    return datetime.datetime.now(zone(WORD_TIMEZONE)).date().isoformat()
+
+
+def score_guess(guess, answer):
+    """Подсветка букв догадки: correct — на месте, present — есть в другом месте, absent — нет.
+    Повторы считаются честно: если в слове одна «e», а в догадке две — подсветится только одна."""
+    marks = ["absent"] * WORD_LENGTH
+    left = {}  # буквы загаданного слова, которые ещё не «заняты» точными попаданиями
+    for i, (g, a) in enumerate(zip(guess, answer)):
+        if g == a:
+            marks[i] = "correct"
+        else:
+            left[a] = left.get(a, 0) + 1
+    for i, g in enumerate(guess):
+        if marks[i] != "correct" and left.get(g, 0) > 0:
+            marks[i] = "present"
+            left[g] -= 1
+    return marks
+
+
+class WordGame:
+    """Одна партия: загаданное слово и догадки игрока."""
+
+    def __init__(self, answer, daily, day=None, guesses=()):
+        self.answer, self.daily, self.day = answer, daily, day
+        self.guesses = list(guesses)
+        self.reward = 0  # сколько монет дали за победу (только слово дня)
+
+    @property
+    def won(self):
+        return bool(self.guesses) and self.guesses[-1] == self.answer
+
+    @property
+    def finished(self):
+        return self.won or len(self.guesses) >= MAX_GUESSES
+
+    def rows(self):
+        return [(guess, score_guess(guess, self.answer)) for guess in self.guesses]
+
+    def letters(self):
+        """Что известно о каждой букве: лучшая подсветка из всех догадок — для клавиатуры."""
+        rank = {"absent": 0, "present": 1, "correct": 2}
+        known = {}
+        for guess, marks in self.rows():
+            for letter, mark in zip(guess, marks):
+                if letter not in known or rank[mark] > rank[known[letter]]:
+                    known[letter] = mark
+        return known
+
+
+word_games = {}  # (сервер, участник) → текущая партия (общая для чата и мини-приложения)
+
+
+def daily_game(guild_id, user_id):
+    """Слово дня для участника: продолжаем сегодняшнюю партию из базы или начинаем новую."""
+    day = word_today()
+    row = db.execute("SELECT answer, guesses FROM word_daily WHERE guild_id = ? AND user_id = ? AND day = ?",
+                     (guild_id, user_id, day)).fetchone()
+    if row:
+        return WordGame(row[0], True, day, [g for g in row[1].split(",") if g])
+    answer = random.Random(f"{guild_id}:{day}").choice(german_words())  # у всех на сервере одно слово
+    db.execute("INSERT INTO word_daily (guild_id, user_id, day, answer, guesses) VALUES (?, ?, ?, ?, '')",
+               (guild_id, user_id, day, answer))
+    db.commit()
+    return WordGame(answer, True, day)
+
+
+def current_word_game(guild_id, user_id):
+    """Текущая партия участника. Начался новый день — слово дня меняется само."""
+    game = word_games.get((guild_id, user_id))
+    if game is None or (game.daily and game.day != word_today()):
+        game = word_games[(guild_id, user_id)] = daily_game(guild_id, user_id)
+    return game
+
+
+def new_word_game(guild_id, user_id, mode):
+    """mode="daily" — вернуться к слову дня, mode="practice" — тренировка со случайным словом."""
+    if mode == "practice":
+        words = german_words()
+        today = daily_game(guild_id, user_id).answer
+        answer = random.choice([word for word in words if word != today] or words)  # не подсказываем слово дня
+        game = WordGame(answer, False)
+    else:
+        game = daily_game(guild_id, user_id)
+    word_games[(guild_id, user_id)] = game
+    return game
+
+
+def make_word_guess(guild_id, member, text):
+    """Догадка участника. Возвращает (партия, текст ошибки или None)."""
+    game = current_word_game(guild_id, member.id)
+    word = text.strip().lower()
+    if game.finished:
+        return game, "Эта партия уже закончена — начни тренировку или приходи за новым словом завтра."
+    if "ß" in word:
+        return game, "Слова с ß в игре не бывает (ß пишется как ss, а это уже лишняя буква)."
+    if len(word) != WORD_LENGTH or not set(word) <= GERMAN_LETTERS:
+        return game, f"Нужно немецкое слово ровно из {WORD_LENGTH} букв (ä, ö, ü — можно)."
+    if ONLY_KNOWN_WORDS and word not in german_words():
+        return game, f"Слова «{word.upper()}» нет в словаре игры."
+    if word in game.guesses:
+        return game, f"«{word.upper()}» уже было — попробуй другое слово."
+    game.guesses.append(word)
+    if game.daily:
+        db.execute("UPDATE word_daily SET guesses = ? WHERE guild_id = ? AND user_id = ? AND day = ?",
+                   (",".join(game.guesses), guild_id, member.id, game.day))
+        db.commit()
+        if game.won:
+            game.reward = WORD_REWARDS[min(len(game.guesses), len(WORD_REWARDS)) - 1]
+            if game.reward:
+                add_money(guild_id, member, game.reward)
+    return game, None
+
+
+def word_game_state(game, guild_id, member):
+    """Состояние партии для мини-приложения (загаданное слово — только когда партия закончена)."""
+    return {
+        "rows": [{"word": guess, "marks": marks} for guess, marks in game.rows()],
+        "letters": game.letters(),
+        "daily": game.daily,
+        "day": game.day,
+        "finished": game.finished,
+        "won": game.won,
+        "answer": game.answer if game.finished else None,
+        "reward": game.reward,
+        "rewards": WORD_REWARDS,
+        "balance": get_wallet(guild_id, member)[0],
+        "length": WORD_LENGTH,
+        "max_guesses": MAX_GUESSES,
+    }
+
+
+def word_result_line(game):
+    """Итог без спойлера: «🟡⚫⚫🟢⚫ / 🟢🟢🟢🟢🟢» — можно показать всему чату."""
+    return "\n".join("".join(WORD_MARKS[mark] for mark in marks) for _, marks in game.rows())
+
+
+async def announce_word_result(channel, member, game):
+    """Пишет в чат, как участник сыграл в слово дня (без самого слова)."""
+    if not (ANNOUNCE_WORD_RESULTS and game.daily and game.finished and channel):
+        return
+    if game.won:
+        tries = len(game.guesses)
+        text = (f"🧩 {member.mention} отгадал(а) немецкое слово дня с {tries}-й попытки"
+                + (f" и получает {money_text(game.reward)}!" if game.reward else "!"))
+    else:
+        text = f"🧩 {member.mention} не отгадал(а) немецкое слово дня. Попробуй и ты — /wort"
+    try:
+        await channel.send(f"{text}\n{word_result_line(game)}", allowed_mentions=NO_PINGS)
+    except discord.HTTPException:
+        pass  # нет прав писать в этот канал — ничего страшного
+
+
+# ---------- Сообщения в чат: кто играет, серия дней и вчерашние итоги ----------
+word_playing = {}  # (сервер, канал, день) → (сообщение «… играют», список игроков)
+word_announce_lock = asyncio.Lock()  # двое зашли одновременно — всё равно одно сообщение
+
+
+def names_text(members):
+    """[A] → «A», [A, B] → «A и B», [A, B, C] → «A, B и C» (упоминания без пинга)."""
+    mentions = [member.mention for member in members]
+    return mentions[0] if len(mentions) == 1 else ", ".join(mentions[:-1]) + " и " + mentions[-1]
+
+
+def word_streak(guild_id, last_day):
+    """Сколько дней подряд (по last_day включительно) на сервере кто-то играл в слово дня."""
+    days = {row[0] for row in db.execute(
+        "SELECT DISTINCT day FROM word_daily WHERE guild_id = ? AND guesses != ''", (guild_id,))}
+    day, streak = datetime.date.fromisoformat(last_day), 0
+    while day.isoformat() in days:
+        streak += 1
+        day -= datetime.timedelta(days=1)
+    return streak
+
+
+def word_summary_text(guild_id, today):
+    """Итоги вчерашнего слова дня: серия дней и кто с какой попытки отгадал. None — вчера никто не играл."""
+    yesterday = (datetime.date.fromisoformat(today) - datetime.timedelta(days=1)).isoformat()
+    results = []
+    for user_id, answer, guesses in db.execute(
+            "SELECT user_id, answer, guesses FROM word_daily WHERE guild_id = ? AND day = ? AND guesses != ''",
+            (guild_id, yesterday)):
+        guesses = guesses.split(",")
+        won = guesses[-1] == answer
+        if won or len(guesses) >= MAX_GUESSES:  # недоигранные партии не считаем
+            results.append((len(guesses) if won else MAX_GUESSES + 1, user_id))
+    if not results:
+        return None
+    results.sort()
+    best = results[0][0]
+    groups = {}  # результат → кто его показал
+    for tries, user_id in results:
+        groups.setdefault(tries, []).append(f"<@{user_id}>")
+    lines = []
+    for tries, people in groups.items():
+        score = f"{tries}/{MAX_GUESSES}" if tries <= MAX_GUESSES else f"X/{MAX_GUESSES}"
+        crown = "👑 " if tries == best and tries <= MAX_GUESSES else ""
+        lines.append(f"{crown}{score}: {' '.join(people)}")
+    streak = word_streak(guild_id, yesterday)
+    head = (f"🔥 **Сервер играет в Wortjagd {streak} {plural(streak, 'день', 'дня', 'дней')} подряд!** "
+            if streak >= 2 else "🧩 ") + "Вчерашние результаты:"
+    answer = db.execute("SELECT answer FROM word_daily WHERE guild_id = ? AND day = ? LIMIT 1",
+                        (guild_id, yesterday)).fetchone()[0]
+    return head + "\n" + "\n".join(lines) + f"\nВчерашнее слово: ||{answer.upper()}||"
+
+
+async def word_player_joined(channel, member):
+    """Участник открыл слово дня: первый за день — итоги вчера; и сообщение «… играют в Wortjagd»."""
+    if not (ANNOUNCE_WORD_RESULTS and channel and getattr(channel, "guild", None)):
+        return
+    guild_id, day = channel.guild.id, word_today()
+    async with word_announce_lock:
+        try:
+            if db.execute("INSERT OR IGNORE INTO word_summary (guild_id, day) VALUES (?, ?)",
+                          (guild_id, day)).rowcount:
+                db.commit()
+                summary = word_summary_text(guild_id, day)
+                if summary:
+                    await channel.send(summary, allowed_mentions=NO_PINGS)
+            for key in [key for key in word_playing if key[2] != day]:
+                del word_playing[key]  # вчерашние сообщения больше не правим
+            key = (guild_id, channel.id, day)
+            message, players = word_playing.get(key, (None, []))
+            if any(player.id == member.id for player in players):
+                return
+            players.append(member)
+            verb = "играет" if len(players) == 1 else "играют"
+            text = f"🧩 {names_text(players)} {verb} в Wortjagd — немецкое слово дня. Присоединяйся: /wort"
+            if message:
+                await message.edit(content=text, allowed_mentions=NO_PINGS)
+            else:
+                message = await channel.send(text, allowed_mentions=NO_PINGS)
+            word_playing[key] = (message, players)
+        except discord.HTTPException:
+            pass  # нет прав писать в канал или сообщение удалили — игре это не мешает
+
+
+# ---------- Игра прямо в чате ----------
+def word_board_text(game, error=None):
+    """Поле игры для чата: догадки с цветными кружками и подсказка по буквам."""
+    title = f"🧩 **Wortjagd** — {'слово дня' if game.daily else 'тренировка'}"
+    lines = [title, ""]
+    for guess, marks in game.rows():
+        lines.append("".join(WORD_MARKS[mark] for mark in marks) + "  `" + " ".join(guess.upper()) + "`")
+    lines += ["⚪⚪⚪⚪⚪"] * (MAX_GUESSES - len(game.guesses))
+    known = game.letters()
+    found = " ".join(sorted(l.upper() for l, m in known.items() if m != "absent"))
+    missing = " ".join(sorted(l.upper() for l, m in known.items() if m == "absent"))
+    if found or missing:
+        lines.append("")
+    if found:
+        lines.append(f"Есть в слове: **{found}**")
+    if missing:
+        lines.append(f"Нет в слове: ~~{missing}~~")
+    lines.append("")
+    if game.won:
+        lines.append(f"🎉 Угадано: **{game.answer.upper()}**"
+                     + (f" — +{money_text(game.reward)}" if game.reward else ""))
+    elif game.finished:
+        lines.append(f"😿 Попытки кончились. Было слово **{game.answer.upper()}**")
+    else:
+        left = MAX_GUESSES - len(game.guesses)
+        lines.append(f"Осталось {left} {plural(left, 'попытка', 'попытки', 'попыток')}. Жми «Угадать».")
+    if error:
+        lines.append(f"⚠️ {error}")
+    return "\n".join(lines)
+
+
+class WordGuessModal(discord.ui.Modal, title="Твоё слово"):
+    word = discord.ui.TextInput(label="Немецкое слово из 5 букв", placeholder="например, APFEL",
+                                min_length=WORD_LENGTH, max_length=WORD_LENGTH)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        game, error = make_word_guess(interaction.guild.id, interaction.user, self.word.value)
+        await interaction.response.edit_message(content=word_board_text(game, error), view=WordView(game))
+        if not error and game.finished:
+            await announce_word_result(interaction.channel, interaction.user, game)
+
+
+class WordView(discord.ui.View):
+    """Кнопки под полем игры в чате (сообщение видит только сам игрок)."""
+
+    def __init__(self, game):
+        super().__init__(timeout=3600)
+        self.guess_button.disabled = game.finished
+        self.daily_button.disabled = game.daily
+
+    @discord.ui.button(label="Угадать", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def guess_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WordGuessModal())
+
+    @discord.ui.button(label="Тренировка", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def practice_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = new_word_game(interaction.guild.id, interaction.user.id, "practice")
+        await interaction.response.edit_message(content=word_board_text(game), view=WordView(game))
+
+    @discord.ui.button(label="Слово дня", emoji="📅", style=discord.ButtonStyle.secondary)
+    async def daily_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = new_word_game(interaction.guild.id, interaction.user.id, "daily")
+        await interaction.response.edit_message(content=word_board_text(game), view=WordView(game))
+
+
+@bot.tree.command(name="wort", description="Wortjagd: угадай немецкое слово из 5 букв")
+@app_commands.describe(where="Где играть: в мини-приложении Discord или прямо в чате")
+@app_commands.choices(where=[app_commands.Choice(name="Мини-приложение", value="app"),
+                             app_commands.Choice(name="В чате", value="chat")])
+@app_commands.guild_only()
+async def wort(interaction: discord.Interaction, where: str = None):
+    note = None
+    if where != "chat":
+        if MINIAPP_READY:
+            try:
+                await interaction.response.launch_activity()  # Discord откроет мини-приложение
+                game = current_word_game(interaction.guild.id, interaction.user.id)
+                if game.daily and not game.finished:
+                    await word_player_joined(interaction.channel, interaction.user)
+                return
+            except discord.HTTPException as error:
+                print("Не получилось открыть мини-приложение:", error)
+                note = "Мини-приложение сейчас не открылось — играем в чате."
+        elif where == "app":
+            note = "Мини-приложение не настроено (см. README) — играем в чате."
+    game = current_word_game(interaction.guild.id, interaction.user.id)
+    await interaction.response.send_message(word_board_text(game, note), view=WordView(game), ephemeral=True)
+    if game.daily and not game.finished:
+        await word_player_joined(interaction.channel, interaction.user)
+
+
+# ---------- Мини-приложение (Discord Activity) ----------
+# Discord показывает страницу miniapp/index.html внутри себя. Страницу и ответы на ходы отдаёт этот
+# веб-сервер. Снаружи до него Discord достучится через туннель (например, cloudflared) — см. README.
+miniapp_sessions = {}  # пропуск → {"guild", "member", "channel", "time"}
+MINIAPP_SESSION_HOURS = 12
+
+
+def miniapp_session(request):
+    """Кто делает запрос: ищем пропуск из заголовка Authorization: Bearer <пропуск>."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    session = miniapp_sessions.get(token)
+    if session is None or time.time() - session["time"] > MINIAPP_SESSION_HOURS * 3600:
+        raise web.HTTPUnauthorized(text='{"error": "Сессия устарела — открой игру заново."}',
+                                   content_type="application/json")
+    return session
+
+
+def json_error(text, status=400):
+    return web.json_response({"error": text}, status=status)
+
+
+async def miniapp_index(request):
+    return web.FileResponse(MINIAPP_PAGE, headers={"Cache-Control": "no-cache"})
+
+
+async def miniapp_config(request):
+    return web.json_response({"client_id": str(bot.application_id)})
+
+
+async def miniapp_token(request):
+    """Вход: страница получила от Discord одноразовый код — меняем его на токен и узнаём, кто это."""
+    body = await request.json()
+    code, guild_id = str(body.get("code") or ""), str(body.get("guild_id") or "")
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post("https://discord.com/api/v10/oauth2/token", data={
+            "client_id": str(bot.application_id), "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code", "code": code,
+        }) as response:
+            if response.status != 200:
+                print("Мини-приложение: Discord не принял код входа:", response.status, await response.text())
+                return json_error("Discord не подтвердил вход. Проверь DISCORD_CLIENT_SECRET.", 401)
+            access_token = (await response.json())["access_token"]
+        async with session.get("https://discord.com/api/v10/users/@me",
+                               headers={"Authorization": f"Bearer {access_token}"}) as response:
+            if response.status != 200:
+                return json_error("Не получилось узнать, кто ты.", 401)
+            user_id = int((await response.json())["id"])
+    guild = bot.get_guild(int(guild_id)) if guild_id.isdigit() else None
+    if guild is None:
+        return json_error("Открой игру на сервере, где есть бот (не в личке).", 403)
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.HTTPException:
+            return json_error("Ты не участник этого сервера.", 403)
+    now = time.time()
+    for token, old in list(miniapp_sessions.items()):  # старые пропуска выбрасываем
+        if now - old["time"] > MINIAPP_SESSION_HOURS * 3600:
+            del miniapp_sessions[token]
+    token = secrets.token_urlsafe(24)
+    channel_id = str(body.get("channel_id") or "")
+    miniapp_sessions[token] = {"guild": guild.id, "member": member, "time": now,
+                               "channel": int(channel_id) if channel_id.isdigit() else None}
+    game = current_word_game(guild.id, member.id)
+    channel = bot.get_channel(miniapp_sessions[token]["channel"] or 0)
+    if game.daily and not game.finished and channel:
+        asyncio.create_task(word_player_joined(channel, member))  # не задерживаем вход в игру
+    return web.json_response({"access_token": access_token, "session": token, "name": member.display_name,
+                              "state": word_game_state(game, guild.id, member)})
+
+
+async def miniapp_state(request):
+    session = miniapp_session(request)
+    game = current_word_game(session["guild"], session["member"].id)
+    return web.json_response({"state": word_game_state(game, session["guild"], session["member"])})
+
+
+async def miniapp_guess(request):
+    session = miniapp_session(request)
+    body = await request.json()
+    game, error = make_word_guess(session["guild"], session["member"], str(body.get("word") or ""))
+    if not error and game.finished and session["channel"]:
+        channel = bot.get_channel(session["channel"])
+        await announce_word_result(channel, session["member"], game)
+    return web.json_response({"state": word_game_state(game, session["guild"], session["member"]), "error": error})
+
+
+async def miniapp_new(request):
+    session = miniapp_session(request)
+    body = await request.json()
+    mode = "practice" if body.get("mode") == "practice" else "daily"
+    game = new_word_game(session["guild"], session["member"].id, mode)
+    return web.json_response({"state": word_game_state(game, session["guild"], session["member"])})
+
+
+@web.middleware
+async def miniapp_errors(request, handler):
+    """Ошибка в мини-приложении не роняет бота: пишем её в логи и отвечаем странице."""
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as error:
+        await report_error(f"Мини-приложение {request.path}", error)
+        return json_error("Что-то пошло не так. Ошибка записана в логи.", 500)
+
+
+async def start_miniapp():
+    """Запускает веб-сервер мини-приложения (если оно настроено)."""
+    if not MINIAPP_READY:
+        print("Мини-приложение выключено: нет DISCORD_CLIENT_SECRET в start.bat (или port = 0). /wort работает в чате.")
+        return
+    app = web.Application(middlewares=[miniapp_errors])
+    app.add_routes([web.get("/", miniapp_index), web.get("/api/config", miniapp_config),
+                    web.post("/api/token", miniapp_token), web.get("/api/state", miniapp_state),
+                    web.post("/api/guess", miniapp_guess), web.post("/api/new", miniapp_new)])
+    app.router.add_static("/static/", os.path.dirname(MINIAPP_PAGE))  # style.css и app.js
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, MINIAPP_HOST, MINIAPP_PORT).start()
+    except OSError as error:
+        print(f"Мини-приложение не запустилось: порт {MINIAPP_PORT} занят или недоступен ({error})")
+        return
+    print(f"Мини-приложение работает на http://{MINIAPP_HOST}:{MINIAPP_PORT} — пробрось его туннелем (см. README)")
 
 
 # Запуск бота. Эта строка "держит" программу работающей, пока её не остановят (Ctrl+C).
