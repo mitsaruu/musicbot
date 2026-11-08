@@ -2512,6 +2512,43 @@ async def take_bet(interaction, bet, what="ставка"):
     return True
 
 
+ALL_IN_WORDS = ("all", "все", "всё", "ва-банк", "вабанк", "allin", "all-in")  # «поставить всё»
+BET_DESCRIPTION = f"Сколько монет поставить (от {MIN_BET}) или all — все монеты"
+
+
+async def parse_bet(interaction, text):
+    """Ставка из поля bet: число или all (все монеты). Возвращает число или None (и сам объясняет ошибку)."""
+    text = text.strip().lower().replace(" ", "")
+    if text in ALL_IN_WORDS:
+        balance, _ = get_wallet(interaction.guild.id, interaction.user)
+        if balance < MIN_BET:
+            await interaction.response.send_message(
+                f"Ставить нечего: у тебя {money_text(balance)}, а минимальная ставка — {money_text(MIN_BET)}. "
+                f"Заработать можно через /work.", ephemeral=True)
+            return None
+        return min(balance, MAX_BET)
+    if not text.isdigit():
+        await interaction.response.send_message(
+            f"Ставка — это число монет (например, 100) или **all**, чтобы поставить всё.", ephemeral=True)
+        return None
+    bet = int(text)
+    if not MIN_BET <= bet <= MAX_BET:
+        await interaction.response.send_message(
+            f"Ставка — от {money_text(MIN_BET)} до {money_text(MAX_BET)}.", ephemeral=True)
+        return None
+    return bet
+
+
+async def bet_autocomplete(interaction: discord.Interaction, current: str):
+    """Подсказка в поле ставки: «all — все монеты» и то, что человек уже набрал."""
+    balance, _ = get_wallet(interaction.guild_id, interaction.user)
+    choices = []
+    if current.strip().isdigit():
+        choices.append(app_commands.Choice(name=f"{current.strip()} монет", value=current.strip()))
+    choices.append(app_commands.Choice(name=f"all — все монеты ({number(min(balance, MAX_BET))})", value="all"))
+    return choices
+
+
 def spin_slots():
     """Крутит три барабана. random.choices выбирает символы с учётом их "веса"."""
     return random.choices(list(SLOT_WEIGHTS), weights=list(SLOT_WEIGHTS.values()), k=3)
@@ -3706,15 +3743,17 @@ async def money_leaderboard(interaction: discord.Interaction):
 # ---------- Игры на монеты ----------
 
 @bot.tree.command(name="coinflip", description="Подбросить монету на ставку (угадал — ставка удваивается)")
-@app_commands.describe(bet="Сколько монет поставить", side="На что ставишь")
+@app_commands.describe(bet=BET_DESCRIPTION, side="На что ставишь")
+@app_commands.autocomplete(bet=bet_autocomplete)
 @app_commands.choices(side=[
     app_commands.Choice(name="🦅 Орёл", value="орёл"),
     app_commands.Choice(name="🪙 Решка", value="решка"),
 ])
 @app_commands.guild_only()
-async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int, MIN_BET, MAX_BET],
+async def coinflip(interaction: discord.Interaction, bet: str,
                    side: app_commands.Choice[str]):
-    if not await take_bet(interaction, bet):
+    bet = await parse_bet(interaction, bet)
+    if bet is None or not await take_bet(interaction, bet):
         return
     result = random.choice(["орёл", "решка"])
     shown = "Выпал **орёл** 🦅" if result == "орёл" else "Выпала **решка** 🪙"
@@ -3728,10 +3767,12 @@ async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int
 
 
 @bot.tree.command(name="slots", description="Сыграть в слоты на монеты")
-@app_commands.describe(bet="Сколько монет поставить")
+@app_commands.describe(bet=BET_DESCRIPTION)
+@app_commands.autocomplete(bet=bet_autocomplete)
 @app_commands.guild_only()
-async def slots(interaction: discord.Interaction, bet: app_commands.Range[int, MIN_BET, MAX_BET]):
-    if not await take_bet(interaction, bet):
+async def slots(interaction: discord.Interaction, bet: str):
+    bet = await parse_bet(interaction, bet)
+    if bet is None or not await take_bet(interaction, bet):
         return
     reels = spin_slots()
     multiplier = slots_multiplier(reels)
@@ -3753,14 +3794,18 @@ async def slots(interaction: discord.Interaction, bet: app_commands.Range[int, M
 
 
 @bot.tree.command(name="blackjack", description="Блэкджек на монеты: можно удвоить и разделить (победа ×2, блэкджек ×2.5)")
-@app_commands.describe(bet="Сколько монет поставить")
+@app_commands.describe(bet=BET_DESCRIPTION)
+@app_commands.autocomplete(bet=bet_autocomplete)
 @app_commands.guild_only()
-async def blackjack(interaction: discord.Interaction, bet: app_commands.Range[int, MIN_BET, MAX_BET]):
+async def blackjack(interaction: discord.Interaction, bet: str):
     if interaction.user.id in blackjack_players:
         await interaction.response.send_message("Сначала доиграй текущую партию 🙂", ephemeral=True)
         return
+    bet = await parse_bet(interaction, bet)
+    if bet is None:
+        return
     blackjack_players.add(interaction.user.id)  # занимаем место сразу, чтобы нельзя было начать две партии
-    if not await take_bet(interaction, bet):
+    if not await take_bet(interaction, bet):  # не хватает монет
         blackjack_players.discard(interaction.user.id)
         return
 
