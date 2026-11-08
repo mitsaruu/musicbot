@@ -3,7 +3,7 @@
 #  Музыка:  /play, /skip, /pause, /resume, /queue, /remove_all, /setvolume, /leave, /top_chart_month
 #           (очередь хранится в базе и не пропадает после /leave и перезапуска)
 #  Уровни:  /rank, /leaderboard  (опыт за сообщения в чате и за время в голосовом канале)
-#  Разное:  /weather, /weather_cities, /dice, /roll, /divination
+#  Разное:  /weather, /weather_cities, /dice, /roll, /predskazanie, /shar
 #  Игра:    /dick_growth, /dick_size, /dick_leaderboard
 #  Деньги:  /work, /balance, /give_money, /money_leaderboard, /coinflip, /slots, /blackjack
 #  Питомцы: /case (дешёвый, средний, дорогой), /cases, /pets, /pets_collect, /pet_feed, /pet_sell — питомцы из кейсов приносят монеты
@@ -200,7 +200,7 @@ growth_cooldown_hours = 24
 [channels]
 ; Команды, которые работают только в канале для игр (его выбирают в Discord командой /games_channel).
 ; Пиши названия через запятую. Пока канал не выбран, все команды работают везде.
-games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, divination
+games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, predskazanie, shar
 
 [moderation]
 ; Тайм-ауты за грубость к боту (мат, оскорбления, непотребства). Первый раз бот просто молчит,
@@ -364,7 +364,7 @@ def is_rude(text):
 DEFAULT_GAMES_COMMANDS = ("rank, leaderboard, top_chart_month, money_leaderboard, "
                           "dick_growth, dick_size, dick_leaderboard, work, balance, give_money, "
                           "coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, "
-                          "dice, roll, divination")
+                          "dice, roll, predskazanie, shar")
 GAMES_COMMANDS = {name.strip().lstrip("/").lower()
                   for name in setting("channels", "games_commands", DEFAULT_GAMES_COMMANDS).split(",")
                   if name.strip()}
@@ -1697,7 +1697,7 @@ def time_left_text(seconds):
         return f"{hours} ч {minutes} мин"
     return f"{max(minutes, 1)} мин"       # меньше минуты всё равно пишем "1 мин"
 
-# Виды предсказаний для /divination: ключ → (заголовок, список предсказаний)
+# Предсказания для /predskazanie и ответы магического шара /shar: ключ → (заголовок, список предсказаний)
 PREDICTIONS = {
     # {name} в тексте бот заменит на упоминание того, кто вызвал команду
     "day": ("🔮 Предсказание", [
@@ -3516,21 +3516,20 @@ async def roll(interaction: discord.Interaction):
     await interaction.response.send_message(f"🎲 {interaction.user.mention} выбрасывает **{number_rolled}** (1–100)")
 
 
-@bot.tree.command(name="divination", description="Шуточное предсказание")
-@app_commands.describe(kind="Какое предсказание нужно", question="Вопрос для магического шара (необязательно)")
-@app_commands.choices(kind=[  # варианты, из которых выбирают в Discord
-    app_commands.Choice(name="🔮 Предсказание", value="day"),
-    app_commands.Choice(name="🎱 Магический шар (да/нет)", value="ball"),
-])
-async def divination(interaction: discord.Interaction, kind: app_commands.Choice[str], question: str | None = None):
-    title, variants = PREDICTIONS[kind.value]  # kind.value — "day", "love" и т. д.
+@bot.tree.command(name="predskazanie", description="Шуточное предсказание")
+async def predskazanie(interaction: discord.Interaction):
+    title, variants = PREDICTIONS["day"]
     answer = random.choice(variants).replace("{name}", interaction.user.mention)  # случайное предсказание
+    await interaction.response.send_message(f"{title} для {interaction.user.mention}\n> {answer}")  # "> " — цитата
 
-    text = f"{title} для {interaction.user.mention}\n"
-    if question:  # если задали вопрос — показываем его
-        text += f"❓ *{question}*\n"
-    text += f"> {answer}"  # "> " — в Discord это оформление цитатой
-    await interaction.response.send_message(text)
+
+@bot.tree.command(name="shar", description="Магический шар: задай вопрос — ответит да или нет")
+@app_commands.describe(question="Вопрос, на который можно ответить «да» или «нет»")
+async def shar(interaction: discord.Interaction, question: app_commands.Range[str, 1, 300]):
+    title, variants = PREDICTIONS["ball"]
+    await interaction.response.send_message(
+        f"{title} для {interaction.user.mention}\n❓ *{question}*\n> {random.choice(variants)}",
+        allowed_mentions=discord.AllowedMentions(users=[interaction.user]))  # пинги из вопроса не срабатывают
 
 
 @bot.tree.command(name="dick_growth",
