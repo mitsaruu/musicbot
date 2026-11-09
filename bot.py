@@ -202,7 +202,7 @@ growth_cooldown_hours = 24
 [channels]
 ; Команды, которые работают только в канале для игр (его выбирают в Discord командой /games_channel).
 ; Пиши названия через запятую. Пока канал не выбран, все команды работают везде.
-games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, predskazanie, shar, wort
+games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, predskazanie, shar, wort, slovo
 
 [moderation]
 ; Тайм-ауты за грубость к боту (мат, оскорбления, непотребства). Первый раз бот просто молчит,
@@ -226,10 +226,23 @@ timezone = Europe/Berlin
 ; Показывать ли в чате картинку с полями игроков (без букв) и итоги вчерашнего дня с серией дней: on или off
 announce = on
 
+[slovo]
+; Игра Словечко (/slovo): угадать русское слово из 5 букв за 6 попыток. Слова — в config/russian_words.txt.
+; Слово дня своё (не то же, что в Wortjagd) — можно сыграть в обе игры.
+; Монеты за отгаданное слово дня: с 1-й попытки, со 2-й ... с 6-й (тренировка без награды)
+rewards = 500, 350, 250, 150, 100, 50
+; Какие слова принимать: wiktionary — из russian_words.txt и любые настоящие русские слова (проверка
+; в русском Викисловаре), list — только из russian_words.txt, off — любое сочетание из 5 букв
+check_words = wiktionary
+; По какому часовому поясу наступает новый день (и новое слово дня)
+timezone = Europe/Moscow
+; Показывать ли в чате картинку с полями игроков (без букв) и итоги вчерашнего дня с серией дней: on или off
+announce = on
+
 [miniapp]
-; Мини-приложение Discord (Activity) для /wort. Работает, если в start.bat есть DISCORD_CLIENT_SECRET.
+; Мини-приложение Discord (Activity) для /wort и /slovo. Работает, если в start.bat есть DISCORD_CLIENT_SECRET.
 ; Веб-сервер слушает этот адрес и порт — до него Discord достучится через туннель (см. README).
-; port = 0 — выключить мини-приложение (и игру /wort)
+; port = 0 — выключить мини-приложение (и игры /wort и /slovo)
 host = 127.0.0.1
 port = 8080
 
@@ -392,7 +405,7 @@ def is_rude(text):
 DEFAULT_GAMES_COMMANDS = ("rank, leaderboard, top_chart_month, money_leaderboard, "
                           "dick_growth, dick_size, dick_leaderboard, work, balance, give_money, "
                           "coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, "
-                          "dice, roll, predskazanie, shar, wort")
+                          "dice, roll, predskazanie, shar, wort, slovo")
 GAMES_COMMANDS = {name.strip().lstrip("/").lower()
                   for name in setting("channels", "games_commands", DEFAULT_GAMES_COMMANDS).split(",")
                   if name.strip()}
@@ -4389,90 +4402,123 @@ async def leave(interaction: discord.Interaction):
 
 
 # ============================================================
-#  WORTJAGD — угадай немецкое слово из 5 букв (/wort)
+#  ИГРЫ В СЛОВА ИЗ 5 БУКВ: Wortjagd — немецкие слова (/wort), Словечко — русские слова (/slovo)
 #  У каждого 6 попыток. После каждой догадки буквы подсвечиваются:
 #  🟢 — буква на своём месте, 🟡 — буква есть в слове, но в другом месте, ⚫ — такой буквы нет.
 #  Слово дня — одно на весь сервер, за победу дают монеты (чем быстрее, тем больше), сыграть — раз в день.
-#  Тренировка — случайные слова без награды, сколько угодно.
+#  Немецкое и русское слово дня — отдельные: можно сыграть в оба. Тренировка — случайные слова без награды.
 #  Играют в мини-приложении Discord (Activity — открывается прямо в Discord). В чате бот держит картинку
 #  с полями всех, кто играет в слово дня (обновляется после каждого хода), и кнопку «Играть!».
-#  Принимаются только настоящие немецкие слова: из config/german_words.txt или из немецкого Викисловаря.
-#  Награды и прочее — в settings.ini, разделы [wortspiel] и [miniapp].
+#  Принимаются только настоящие слова: из словаря игры или из Викисловаря (немецкого / русского).
+#  Награды и прочее — в settings.ini, разделы [wortspiel], [slovo] и [miniapp].
 # ============================================================
 import secrets  # случайные «пропуска» для мини-приложения, которые нельзя угадать
 from aiohttp import web  # маленький веб-сервер для мини-приложения (входит в aiohttp)
 
-WORDS_PATH = os.path.join(CONFIG_DIR, "german_words.txt")
 MINIAPP_PAGE = os.path.join(BASE_DIR, "miniapp", "index.html")  # страница мини-приложения
 WORD_LENGTH = 5
 MAX_GUESSES = 6
-GERMAN_LETTERS = set("abcdefghijklmnopqrstuvwxyzäöü")
-FALLBACK_WORDS = ["apfel", "blume", "brief", "feuer", "fisch", "katze", "kraft", "licht", "nacht", "sonne",
-                  "stein", "stern", "stuhl", "tisch", "traum", "vogel", "wagen", "wolke", "zunge", "zwerg"]
 WORD_MARKS = {"correct": "🟢", "present": "🟡", "absent": "⚫"}  # цвета букв в чате
-WORD_REWARDS = [int(value) for value in
-                re.findall(r"\d+", setting("wortspiel", "rewards", "500, 350, 250, 150, 100, 50"))] or [0]
-# Как проверять, что слово существует: wiktionary — словарь игры + немецкий Викисловарь,
-# list — только словарь игры (german_words.txt), off — любое сочетание из 5 букв
-WORD_CHECK = setting("wortspiel", "check_words", "wiktionary").lower()
-WORD_EPOCH = datetime.date(2026, 11, 8)  # день №1 игры — для номера в «Wortjagd №…»
-WORD_TIMEZONE = setting("wortspiel", "timezone", "Europe/Berlin")  # когда начинается новый день
-ANNOUNCE_WORD_RESULTS = setting("wortspiel", "announce", "on").lower() == "on"
+
+
+def word_rewards(section):
+    return [int(value) for value in
+            re.findall(r"\d+", setting(section, "rewards", "500, 350, 250, 150, 100, 50"))] or [0]
+
+
+# Настройки каждой игры. check — как проверять, что слово существует: wiktionary — словарь игры + Викисловарь,
+# list — только словарь игры, off — любое сочетание из 5 букв.
+WORD_LANGS = {
+    "de": {
+        "name": "Wortjagd", "command": "/wort", "what": "немецкое слово", "language": "немецком",
+        "letters": set("abcdefghijklmnopqrstuvwxyzäöü"),
+        "path": os.path.join(CONFIG_DIR, "german_words.txt"),
+        "fallback": ["apfel", "blume", "brief", "feuer", "fisch", "katze", "kraft", "licht", "nacht", "sonne",
+                     "stein", "stern", "stuhl", "tisch", "traum", "vogel", "wagen", "wolke", "zunge", "zwerg"],
+        "rewards": word_rewards("wortspiel"),
+        "check": setting("wortspiel", "check_words", "wiktionary").lower(),
+        "timezone": setting("wortspiel", "timezone", "Europe/Berlin"),  # когда начинается новый день
+        "announce": setting("wortspiel", "announce", "on").lower() == "on",
+        "epoch": datetime.date(2026, 11, 8),  # день №1 игры — для номера на картинке
+        "wiki": "https://de.wiktionary.org/w/api.php", "wiki_mark": "{{Sprache|Deutsch}}",
+        "table": "word_daily", "summary_table": "word_summary", "seed": "", "button": "wortjagd:play",
+    },
+    "ru": {
+        "name": "Словечко", "command": "/slovo", "what": "русское слово", "language": "русском",
+        "letters": set("абвгдежзийклмнопрстуфхцчшщъыьэюя"),
+        "path": os.path.join(CONFIG_DIR, "russian_words.txt"),
+        "fallback": ["арбуз", "берег", "ветер", "война", "дождь", "замок", "зебра", "игрок", "книга", "кошка",
+                     "лампа", "лодка", "мечта", "огонь", "песня", "птица", "сосна", "сумка", "улица", "школа"],
+        "rewards": word_rewards("slovo"),
+        "check": setting("slovo", "check_words", "wiktionary").lower(),
+        "timezone": setting("slovo", "timezone", "Europe/Moscow"),
+        "announce": setting("slovo", "announce", "on").lower() == "on",
+        "epoch": datetime.date(2026, 11, 9),
+        "wiki": "https://ru.wiktionary.org/w/api.php", "wiki_mark": "{{-ru-",
+        "table": "word_daily_ru", "summary_table": "word_summary_ru", "seed": "ru:", "button": "slovo:play",
+    },
+}
 MINIAPP_HOST = setting("miniapp", "host", "127.0.0.1")
 MINIAPP_PORT = setting("miniapp", "port", 8080)
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")  # секрет приложения из Developer Portal → OAuth2
 MINIAPP_READY = bool(DISCORD_CLIENT_SECRET) and MINIAPP_PORT > 0
 
-db.execute("""
-    CREATE TABLE IF NOT EXISTS word_daily (
-        guild_id INTEGER,
-        user_id  INTEGER,
-        day      TEXT,      -- день, например "2026-11-08"
-        answer   TEXT,      -- загаданное слово (чтобы правка словаря не меняла начатую игру)
-        guesses  TEXT,      -- догадки через запятую
-        PRIMARY KEY (guild_id, user_id, day)
-    )
-""")
-db.commit()
+for word_lang in WORD_LANGS.values():
+    db.execute(f"""
+        CREATE TABLE IF NOT EXISTS {word_lang["table"]} (
+            guild_id INTEGER,
+            user_id  INTEGER,
+            day      TEXT,      -- день, например "2026-11-08"
+            answer   TEXT,      -- загаданное слово (чтобы правка словаря не меняла начатую игру)
+            guesses  TEXT,      -- догадки через запятую
+            PRIMARY KEY (guild_id, user_id, day)
+        )
+    """)
+    # Для каких дней на сервере уже написали итоги вчерашнего дня (чтобы не повторять после перезапуска)
+    db.execute(f"""
+        CREATE TABLE IF NOT EXISTS {word_lang["summary_table"]} (
+            guild_id INTEGER,
+            day      TEXT,
+            PRIMARY KEY (guild_id, day)
+        )
+    """)
 
-
-# Проверенные в Викисловаре слова: valid = 1 — настоящее немецкое слово, 0 — такого нет
+# Проверенные в Викисловаре слова: valid = 1 — настоящее слово, 0 — такого нет (немецкие и русские вместе —
+# алфавиты разные, не перепутаются)
 db.execute("""
     CREATE TABLE IF NOT EXISTS word_check (
         word  TEXT PRIMARY KEY,
         valid INTEGER
     )
 """)
-
-# Для каких дней на сервере уже написали итоги вчерашнего дня (чтобы не повторять после перезапуска)
-db.execute("""
-    CREATE TABLE IF NOT EXISTS word_summary (
-        guild_id INTEGER,
-        day      TEXT,
-        PRIMARY KEY (guild_id, day)
-    )
-""")
 db.commit()
 
 
-def parse_words(text):
-    """Текст файла со словами → список слов из 5 немецких букв без повторов."""
+def normalize_word(text, lang):
+    """Как игрок написал слово → как его хранит игра: строчными, в русском ё = е."""
+    word = text.strip().lower()
+    return word.replace("ё", "е") if lang == "ru" else word
+
+
+def parse_words(text, lang):
+    """Текст файла со словами → список слов из 5 букв нужного языка без повторов."""
     words = []
     for line in text.splitlines():
         if line.strip().startswith("#"):
             continue
-        for word in re.split(r"[\s,;]+", line.lower()):
-            if len(word) == WORD_LENGTH and set(word) <= GERMAN_LETTERS and word not in words:
+        for word in re.split(r"[\s,;]+", normalize_word(line, lang)):
+            if len(word) == WORD_LENGTH and set(word) <= WORD_LANGS[lang]["letters"] and word not in words:
                 words.append(word)
-    return words or FALLBACK_WORDS
+    return words or WORD_LANGS[lang]["fallback"]
 
 
-def german_words():
-    return cached_file(WORDS_PATH, parse_words, FALLBACK_WORDS)
+def game_words(lang):
+    info = WORD_LANGS[lang]
+    return cached_file(info["path"], lambda text: parse_words(text, lang), info["fallback"])
 
 
-def word_today():
-    return datetime.datetime.now(zone(WORD_TIMEZONE)).date().isoformat()
+def word_today(lang):
+    return datetime.datetime.now(zone(WORD_LANGS[lang]["timezone"])).date().isoformat()
 
 
 def score_guess(guess, answer):
@@ -4495,8 +4541,8 @@ def score_guess(guess, answer):
 class WordGame:
     """Одна партия: загаданное слово и догадки игрока."""
 
-    def __init__(self, answer, daily, day=None, guesses=()):
-        self.answer, self.daily, self.day = answer, daily, day
+    def __init__(self, answer, daily, day=None, guesses=(), lang="de"):
+        self.answer, self.daily, self.day, self.lang = answer, daily, day, lang
         self.guesses = list(guesses)
         self.reward = 0  # сколько монет дали за победу (только слово дня)
 
@@ -4522,100 +4568,113 @@ class WordGame:
         return known
 
 
-word_games = {}  # (сервер, участник) → текущая партия (общая для чата и мини-приложения)
+word_games = {}  # (сервер, участник, язык) → текущая партия
 
 
-def daily_game(guild_id, user_id):
+def daily_game(guild_id, user_id, lang):
     """Слово дня для участника: продолжаем сегодняшнюю партию из базы или начинаем новую."""
-    day = word_today()
-    row = db.execute("SELECT answer, guesses FROM word_daily WHERE guild_id = ? AND user_id = ? AND day = ?",
+    info, day = WORD_LANGS[lang], word_today(lang)
+    row = db.execute(f"SELECT answer, guesses FROM {info['table']} WHERE guild_id = ? AND user_id = ? AND day = ?",
                      (guild_id, user_id, day)).fetchone()
     if row:
-        return WordGame(row[0], True, day, [g for g in row[1].split(",") if g])
-    answer = random.Random(f"{guild_id}:{day}").choice(german_words())  # у всех на сервере одно слово
-    db.execute("INSERT INTO word_daily (guild_id, user_id, day, answer, guesses) VALUES (?, ?, ?, ?, '')",
+        return WordGame(row[0], True, day, [g for g in row[1].split(",") if g], lang)
+    answer = random.Random(f"{info['seed']}{guild_id}:{day}").choice(game_words(lang))  # у всех на сервере одно
+    db.execute(f"INSERT INTO {info['table']} (guild_id, user_id, day, answer, guesses) VALUES (?, ?, ?, ?, '')",
                (guild_id, user_id, day, answer))
     db.commit()
-    return WordGame(answer, True, day)
+    return WordGame(answer, True, day, lang=lang)
 
 
-def current_word_game(guild_id, user_id):
+def current_word_game(guild_id, user_id, lang):
     """Текущая партия участника. Начался новый день — слово дня меняется само."""
-    game = word_games.get((guild_id, user_id))
-    if game is None or (game.daily and game.day != word_today()):
-        game = word_games[(guild_id, user_id)] = daily_game(guild_id, user_id)
+    game = word_games.get((guild_id, user_id, lang))
+    if game is None or (game.daily and game.day != word_today(lang)):
+        game = word_games[(guild_id, user_id, lang)] = daily_game(guild_id, user_id, lang)
     return game
 
 
-def new_word_game(guild_id, user_id, mode):
+def new_word_game(guild_id, user_id, mode, lang):
     """mode="daily" — вернуться к слову дня, mode="practice" — тренировка со случайным словом."""
     if mode == "practice":
-        words = german_words()
-        today = daily_game(guild_id, user_id).answer
+        words = game_words(lang)
+        today = daily_game(guild_id, user_id, lang).answer
         answer = random.choice([word for word in words if word != today] or words)  # не подсказываем слово дня
-        game = WordGame(answer, False)
+        game = WordGame(answer, False, lang=lang)
     else:
-        game = daily_game(guild_id, user_id)
-    word_games[(guild_id, user_id)] = game
+        game = daily_game(guild_id, user_id, lang)
+    word_games[(guild_id, user_id, lang)] = game
     return game
 
 
-async def is_german_word(word):
-    """Существует ли такое немецкое слово. True / False, или None — если проверить не получилось."""
-    if WORD_CHECK == "off" or word in german_words():
+def wiki_titles(word, lang):
+    """Какие страницы искать в Викисловаре. В русском ё пишут как е, поэтому для «елка» ищем и «ёлка»."""
+    if lang == "de":
+        return [word.capitalize(), word]  # существительные там с большой буквы: «Kerze»
+    return [word] + [word[:i] + "ё" + word[i + 1:] for i, letter in enumerate(word) if letter == "е"]
+
+
+async def is_real_word(word, lang):
+    """Существует ли такое слово. True / False, или None — если проверить не получилось."""
+    info = WORD_LANGS[lang]
+    if info["check"] == "off" or word in game_words(lang):
         return True
-    if WORD_CHECK == "list":
+    if info["check"] == "list":
         return False
     row = db.execute("SELECT valid FROM word_check WHERE word = ?", (word,)).fetchone()
     if row:
         return bool(row[0])
-    # Спрашиваем немецкий Викисловарь: есть ли страница «Kerze» или «kerze» с немецкой статьёй.
-    # Там есть и формы слов («gehst», «Krüge»), а выдуманных сочетаний вроде «kzrze» — нет.
-    params = {"action": "query", "titles": f"{word.capitalize()}|{word}", "prop": "revisions",
+    # Спрашиваем Викисловарь: есть ли страница с этим словом и статьёй на нужном языке. Там есть и формы
+    # слов («gehst», «столы»), а выдуманных сочетаний вроде «kzrze» — нет.
+    params = {"action": "query", "titles": "|".join(wiki_titles(word, lang)), "prop": "revisions",
               "rvprop": "content", "rvslots": "main", "redirects": "1", "format": "json", "formatversion": "2"}
     try:
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "musicbot-wortjagd/1.0"}) as session:
-            async with session.get("https://de.wiktionary.org/w/api.php", params=params) as response:
+            async with session.get(info["wiki"], params=params) as response:
                 data = await response.json(content_type=None)
         pages = data["query"]["pages"]
     except Exception as error:
-        print("Wortjagd: Викисловарь не ответил:", error)
+        print(f"{info['name']}: Викисловарь не ответил:", error)
         return None
-    valid = any("{{Sprache|Deutsch}}" in page["revisions"][0]["slots"]["main"]["content"]
+    valid = any(info["wiki_mark"] in page["revisions"][0]["slots"]["main"]["content"]
                 for page in pages if page.get("revisions"))
     db.execute("INSERT OR REPLACE INTO word_check (word, valid) VALUES (?, ?)", (word, int(valid)))
     db.commit()
     return valid
 
 
-async def make_word_guess(guild_id, member, text):
+async def make_word_guess(guild_id, member, text, lang):
     """Догадка участника. Возвращает (партия, текст ошибки или None)."""
-    word = text.strip().lower()
-    game = current_word_game(guild_id, member.id)
+    info = WORD_LANGS[lang]
+    word = normalize_word(text, lang)
+    game = current_word_game(guild_id, member.id, lang)
+    finished = "Эта партия уже закончена — начни тренировку или приходи за новым словом завтра."
     if game.finished:
-        return game, "Эта партия уже закончена — начни тренировку или приходи за новым словом завтра."
-    if "ß" in word:
+        return game, finished
+    if lang == "de" and "ß" in word:
         return game, "Слова с ß в игре не бывает (ß пишется как ss, а это уже лишняя буква)."
-    if len(word) != WORD_LENGTH or not set(word) <= GERMAN_LETTERS:
-        return game, f"Нужно немецкое слово ровно из {WORD_LENGTH} букв (ä, ö, ü — можно)."
-    real = await is_german_word(word)
-    game = current_word_game(guild_id, member.id)  # пока проверяли слово, партия могла измениться
+    if len(word) != WORD_LENGTH or not set(word) <= info["letters"]:
+        hint = " (ä, ö, ü — можно)" if lang == "de" else ""
+        return game, f"Нужно {info['what']} ровно из {WORD_LENGTH} букв{hint}."
+    real = await is_real_word(word, lang)
+    game = current_word_game(guild_id, member.id, lang)  # пока проверяли слово, партия могла измениться
     if real is None:
         return game, "Не получилось проверить слово (Викисловарь не отвечает) — попробуй ещё раз."
     if not real:
-        return game, f"Слова «{word.upper()}» нет в немецком языке."
+        if lang == "ru":  # в русском Викисловаре есть не все формы слов («клёны»), поэтому подсказываем
+            return game, f"Не знаю слова «{word.upper()}». Лучше пиши существительные в начальной форме: «кошка», а не «кошки»."
+        return game, f"Слова «{word.upper()}» нет в {info['language']} языке."
     if game.finished:
-        return game, "Эта партия уже закончена — начни тренировку или приходи за новым словом завтра."
+        return game, finished
     if word in game.guesses:
         return game, f"«{word.upper()}» уже было — попробуй другое слово."
     game.guesses.append(word)
     if game.daily:
-        db.execute("UPDATE word_daily SET guesses = ? WHERE guild_id = ? AND user_id = ? AND day = ?",
+        db.execute(f"UPDATE {info['table']} SET guesses = ? WHERE guild_id = ? AND user_id = ? AND day = ?",
                    (",".join(game.guesses), guild_id, member.id, game.day))
         db.commit()
         if game.won:
-            game.reward = WORD_REWARDS[min(len(game.guesses), len(WORD_REWARDS)) - 1]
+            game.reward = info["rewards"][min(len(game.guesses), len(info["rewards"])) - 1]
             if game.reward:
                 add_money(guild_id, member, game.reward)
     return game, None
@@ -4624,6 +4683,8 @@ async def make_word_guess(guild_id, member, text):
 def word_game_state(game, guild_id, member):
     """Состояние партии для мини-приложения (загаданное слово — только когда партия закончена)."""
     return {
+        "lang": game.lang,
+        "name": WORD_LANGS[game.lang]["name"],
         "rows": [{"word": guess, "marks": marks} for guess, marks in game.rows()],
         "letters": game.letters(),
         "daily": game.daily,
@@ -4632,7 +4693,7 @@ def word_game_state(game, guild_id, member):
         "won": game.won,
         "answer": game.answer if game.finished else None,
         "reward": game.reward,
-        "rewards": WORD_REWARDS,
+        "rewards": WORD_LANGS[game.lang]["rewards"],
         "balance": get_wallet(guild_id, member)[0],
         "length": WORD_LENGTH,
         "max_guesses": MAX_GUESSES,
@@ -4640,7 +4701,7 @@ def word_game_state(game, guild_id, member):
 
 
 # ---------- Сообщения в чат: картинка с полями игроков, серия дней и вчерашние итоги ----------
-word_playing = {}  # (сервер, канал, день) → (сообщение с картинкой, список игроков)
+word_playing = {}  # (сервер, канал, день, язык) → (сообщение с картинкой, список игроков)
 word_announce_lock = asyncio.Lock()  # двое зашли одновременно — всё равно одно сообщение
 
 
@@ -4650,10 +4711,10 @@ def names_text(members):
     return mentions[0] if len(mentions) == 1 else ", ".join(mentions[:-1]) + " и " + mentions[-1]
 
 
-def word_streak(guild_id, last_day):
+def word_streak(guild_id, last_day, lang):
     """Сколько дней подряд (по last_day включительно) на сервере кто-то играл в слово дня."""
     days = {row[0] for row in db.execute(
-        "SELECT DISTINCT day FROM word_daily WHERE guild_id = ? AND guesses != ''", (guild_id,))}
+        f"SELECT DISTINCT day FROM {WORD_LANGS[lang]['table']} WHERE guild_id = ? AND guesses != ''", (guild_id,))}
     day, streak = datetime.date.fromisoformat(last_day), 0
     while day.isoformat() in days:
         streak += 1
@@ -4661,12 +4722,13 @@ def word_streak(guild_id, last_day):
     return streak
 
 
-def word_summary_text(guild_id, today):
+def word_summary_text(guild_id, today, lang):
     """Итоги вчерашнего слова дня: серия дней и кто с какой попытки отгадал. None — вчера никто не играл."""
+    info = WORD_LANGS[lang]
     yesterday = (datetime.date.fromisoformat(today) - datetime.timedelta(days=1)).isoformat()
     results = []
     for user_id, answer, guesses in db.execute(
-            "SELECT user_id, answer, guesses FROM word_daily WHERE guild_id = ? AND day = ? AND guesses != ''",
+            f"SELECT user_id, answer, guesses FROM {info['table']} WHERE guild_id = ? AND day = ? AND guesses != ''",
             (guild_id, yesterday)):
         guesses = guesses.split(",")
         won = guesses[-1] == answer
@@ -4684,10 +4746,10 @@ def word_summary_text(guild_id, today):
         score = f"{tries}/{MAX_GUESSES}" if tries <= MAX_GUESSES else f"X/{MAX_GUESSES}"
         crown = "👑 " if tries == best and tries <= MAX_GUESSES else ""
         lines.append(f"{crown}{score}: {' '.join(people)}")
-    streak = word_streak(guild_id, yesterday)
-    head = (f"🔥 **Сервер играет в Wortjagd {streak} {plural(streak, 'день', 'дня', 'дней')} подряд!** "
-            if streak >= 2 else "🧩 ") + "Вчерашние результаты:"
-    answer = db.execute("SELECT answer FROM word_daily WHERE guild_id = ? AND day = ? LIMIT 1",
+    streak = word_streak(guild_id, yesterday, lang)
+    head = (f"🔥 **Сервер играет в {info['name']} {streak} {plural(streak, 'день', 'дня', 'дней')} подряд!** "
+            if streak >= 2 else "🧩 ") + f"Вчерашние результаты ({info['name']}):"
+    answer = db.execute(f"SELECT answer FROM {info['table']} WHERE guild_id = ? AND day = ? LIMIT 1",
                         (guild_id, yesterday)).fetchone()[0]
     return head + "\n" + "\n".join(lines) + f"\nВчерашнее слово: ||{answer.upper()}||"
 
@@ -4695,7 +4757,7 @@ def word_summary_text(guild_id, today):
 WORD_COLORS = {"correct": (47, 166, 106), "present": (217, 154, 43), "absent": (70, 73, 84)}
 
 
-def make_word_board_image(day_number, players):
+def make_word_board_image(title, players):
     """Картинка «Wortjagd №N»: карточка на каждого игрока — аватарка, имя, поле без букв и счёт.
     players — список (имя, байты аватарки, подсветки догадок, подпись вроде «3/6»)."""
     cell, gap, per_row = 24, 5, 5
@@ -4706,7 +4768,7 @@ def make_word_board_image(day_number, players):
     height = 64 + rows * card_h + (rows - 1) * 14 + pad
     image = Image.new("RGB", (width, height), (23, 24, 28))
     draw = ImageDraw.Draw(image)
-    draw.text((width / 2, 34), f"Wortjagd №{day_number}", font=load_font(26, True), fill=(242, 243, 245), anchor="mm")
+    draw.text((width / 2, 34), title, font=load_font(26, True), fill=(242, 243, 245), anchor="mm")
     left0 = (width - (columns * card_w + (columns - 1) * 14)) // 2
     name_font, score_font = load_font(17, True), load_font(18, True)
     for index, (name, avatar_bytes, rows_marks, score) in enumerate(players):
@@ -4734,36 +4796,41 @@ def make_word_board_image(day_number, players):
 
 
 class WordPlayView(discord.ui.View):
-    """Кнопка «Играть!» под картинкой: открывает мини-приложение. Работает и после перезапуска бота."""
+    """Кнопка «Играть!» под картинкой: открывает мини-приложение с нужной игрой. Работает и после перезапуска."""
 
-    def __init__(self):
+    def __init__(self, lang):
         super().__init__(timeout=None)
+        button = discord.ui.Button(label="Играть!", emoji="🧩", style=discord.ButtonStyle.primary,
+                                   custom_id=WORD_LANGS[lang]["button"])
 
-    @discord.ui.button(label="Играть!", emoji="🧩", style=discord.ButtonStyle.primary, custom_id="wortjagd:play")
-    async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await open_word_miniapp(interaction)
+        async def play(interaction: discord.Interaction):
+            await open_word_miniapp(interaction, lang)
+
+        button.callback = play
+        self.add_item(button)
 
 
 word_avatars = {}  # участник → байты аватарки (чтобы не качать её при каждом ходе)
 
 
-async def word_board_update(channel, member=None):
+async def word_board_update(channel, member=None, lang="de"):
     """Картинка с полями игроков слова дня в канале: создаёт её или обновляет.
     member — кто только что открыл игру (его добавляем; первый за день вызывает и итоги вчерашнего дня)."""
-    if not (ANNOUNCE_WORD_RESULTS and channel and getattr(channel, "guild", None)):
+    info = WORD_LANGS[lang]
+    if not (info["announce"] and channel and getattr(channel, "guild", None)):
         return
-    guild_id, day = channel.guild.id, word_today()
+    guild_id, day = channel.guild.id, word_today(lang)
     async with word_announce_lock:
         try:
-            if member and db.execute("INSERT OR IGNORE INTO word_summary (guild_id, day) VALUES (?, ?)",
+            if member and db.execute(f"INSERT OR IGNORE INTO {info['summary_table']} (guild_id, day) VALUES (?, ?)",
                                      (guild_id, day)).rowcount:
                 db.commit()
-                summary = word_summary_text(guild_id, day)
+                summary = word_summary_text(guild_id, day, lang)
                 if summary:
                     await channel.send(summary, allowed_mentions=NO_PINGS)
-            for key in [key for key in word_playing if key[2] != day]:
+            for key in [key for key in word_playing if key[3] == lang and key[2] != day]:
                 del word_playing[key]  # вчерашние картинки больше не обновляем
-            key = (guild_id, channel.id, day)
+            key = (guild_id, channel.id, day, lang)
             message, players = word_playing.get(key, (None, []))
             if member and not any(player.id == member.id for player in players):
                 players.append(member)
@@ -4773,40 +4840,47 @@ async def word_board_update(channel, member=None):
             for player in players:
                 if player.id not in word_avatars:
                     word_avatars[player.id] = await get_avatar(player)
-                game = daily_game(guild_id, player.id)
+                game = daily_game(guild_id, player.id, lang)
                 marks = [marks for _, marks in game.rows()]
                 score = (f"{len(game.guesses)}/{MAX_GUESSES}" if game.won else
                          f"X/{MAX_GUESSES}" if game.finished else "играет…")
                 cards.append((player.display_name, word_avatars[player.id], marks, score))
-            day_number = (datetime.date.fromisoformat(day) - WORD_EPOCH).days + 1
-            png = await asyncio.to_thread(make_word_board_image, day_number, cards)
+            day_number = (datetime.date.fromisoformat(day) - info["epoch"]).days + 1
+            png = await asyncio.to_thread(make_word_board_image, f"{info['name']} №{day_number}", cards)
             if any(score == "играет…" for *_, score in cards):
                 verb = "играет" if len(players) == 1 else "играют"
             else:
                 verb = "сыграл(а)" if len(players) == 1 else "сыграли"
-            text = f"🧩 {names_text(players)} {verb} в Wortjagd — немецкое слово дня"
-            file = discord.File(io.BytesIO(png), filename="wortjagd.png")
+            text = f"🧩 {names_text(players)} {verb} в {info['name']} — {info['what']} дня"
+            filename = f"{info['button'].split(':')[0]}.png"
+            file = discord.File(io.BytesIO(png), filename=filename)
             if message:
                 try:
-                    await message.edit(content=text, attachments=[file], view=WordPlayView(),
+                    await message.edit(content=text, attachments=[file], view=WordPlayView(lang),
                                        allowed_mentions=NO_PINGS)
                 except discord.NotFound:
                     message = None  # картинку удалили — пришлём новую
-                    file = discord.File(io.BytesIO(png), filename="wortjagd.png")
+                    file = discord.File(io.BytesIO(png), filename=filename)
             if message is None:
-                message = await channel.send(text, file=file, view=WordPlayView(), allowed_mentions=NO_PINGS)
+                message = await channel.send(text, file=file, view=WordPlayView(lang), allowed_mentions=NO_PINGS)
             word_playing[key] = (message, players)
         except discord.HTTPException as error:
-            print("Wortjagd: не получилось обновить картинку в чате:", error)
+            print(f"{info['name']}: не получилось обновить картинку в чате:", error)
 
 
-async def open_word_miniapp(interaction):
-    """Открывает мини-приложение (команда /wort или кнопка «Играть!»)."""
+word_lang_choice = {}  # (сервер, участник) → в какую игру он последний раз позвал (/wort или /slovo)
+
+
+async def open_word_miniapp(interaction, lang):
+    """Открывает мини-приложение (команды /wort, /slovo или кнопка «Играть!») сразу на нужной игре."""
+    name = WORD_LANGS[lang]["name"]
     if not MINIAPP_READY:
         await interaction.response.send_message(
-            "🧩 Мини-приложение Wortjagd ещё не настроено. Админу: инструкция в README, раздел «Wortjagd».",
+            f"🧩 Мини-приложение {name} ещё не настроено. Админу: инструкция в README, раздел «Wortjagd».",
             ephemeral=True)
         return
+    if interaction.guild:
+        word_lang_choice[(interaction.guild.id, interaction.user.id)] = lang  # страница спросит при входе
     try:
         await interaction.response.launch_activity()  # Discord откроет игру
         return
@@ -4827,13 +4901,19 @@ async def open_word_miniapp(interaction):
 @bot.tree.command(name="wort", description="Wortjagd: угадай немецкое слово из 5 букв (мини-приложение)")
 @app_commands.guild_only()
 async def wort(interaction: discord.Interaction):
-    await open_word_miniapp(interaction)
+    await open_word_miniapp(interaction, "de")
+
+
+@bot.tree.command(name="slovo", description="Словечко: угадай русское слово из 5 букв (мини-приложение)")
+@app_commands.guild_only()
+async def slovo(interaction: discord.Interaction):
+    await open_word_miniapp(interaction, "ru")
 
 
 # ---------- Мини-приложение (Discord Activity) ----------
 # Discord показывает страницу miniapp/index.html внутри себя. Страницу и ответы на ходы отдаёт этот
 # веб-сервер. Снаружи до него Discord достучится через туннель (например, cloudflared) — см. README.
-miniapp_sessions = {}  # пропуск → {"guild", "member", "channel", "time"}
+miniapp_sessions = {}  # пропуск → {"guild", "member", "channel", "time", "lang"}
 MINIAPP_SESSION_HOURS = 12
 
 
@@ -4893,29 +4973,31 @@ async def miniapp_token(request):
             del miniapp_sessions[token]
     token = secrets.token_urlsafe(24)
     channel_id = str(body.get("channel_id") or "")
-    miniapp_sessions[token] = {"guild": guild.id, "member": member, "time": now,
+    lang = word_lang_choice.get((guild.id, member.id), "de")  # какую игру звал: /wort или /slovo
+    miniapp_sessions[token] = {"guild": guild.id, "member": member, "time": now, "lang": lang,
                                "channel": int(channel_id) if channel_id.isdigit() else None}
-    game = current_word_game(guild.id, member.id)
+    game = current_word_game(guild.id, member.id, lang)
     channel = bot.get_channel(miniapp_sessions[token]["channel"] or 0)
     if game.daily and not game.finished and channel:
-        asyncio.create_task(word_board_update(channel, member))  # не задерживаем вход в игру
+        asyncio.create_task(word_board_update(channel, member, lang))  # не задерживаем вход в игру
     return web.json_response({"access_token": access_token, "session": token, "name": member.display_name,
                               "state": word_game_state(game, guild.id, member)})
 
 
 async def miniapp_state(request):
     session = miniapp_session(request)
-    game = current_word_game(session["guild"], session["member"].id)
+    game = current_word_game(session["guild"], session["member"].id, session["lang"])
     return web.json_response({"state": word_game_state(game, session["guild"], session["member"])})
 
 
 async def miniapp_guess(request):
     session = miniapp_session(request)
     body = await request.json()
-    game, error = await make_word_guess(session["guild"], session["member"], str(body.get("word") or ""))
+    game, error = await make_word_guess(session["guild"], session["member"], str(body.get("word") or ""),
+                                        session["lang"])
     if not error and game.daily and session["channel"]:
         channel = bot.get_channel(session["channel"])
-        asyncio.create_task(word_board_update(channel, session["member"]))  # обновляем картинку в чате
+        asyncio.create_task(word_board_update(channel, session["member"], game.lang))  # обновляем картинку в чате
     return web.json_response({"state": word_game_state(game, session["guild"], session["member"]), "error": error})
 
 
@@ -4923,7 +5005,13 @@ async def miniapp_new(request):
     session = miniapp_session(request)
     body = await request.json()
     mode = "practice" if body.get("mode") == "practice" else "daily"
-    game = new_word_game(session["guild"], session["member"].id, mode)
+    if body.get("lang") in WORD_LANGS:  # переключили язык прямо в игре
+        session["lang"] = body["lang"]
+        word_lang_choice[(session["guild"], session["member"].id)] = body["lang"]
+    game = new_word_game(session["guild"], session["member"].id, mode, session["lang"])
+    channel = bot.get_channel(session["channel"] or 0)
+    if game.daily and not game.finished and channel and "lang" in body:
+        asyncio.create_task(word_board_update(channel, session["member"], game.lang))
     return web.json_response({"state": word_game_state(game, session["guild"], session["member"])})
 
 
@@ -4941,9 +5029,10 @@ async def miniapp_errors(request, handler):
 
 async def start_miniapp():
     """Запускает веб-сервер мини-приложения (если оно настроено)."""
-    bot.add_view(WordPlayView())  # кнопки «Играть!» под старыми картинками работают и после перезапуска
+    for lang in WORD_LANGS:
+        bot.add_view(WordPlayView(lang))  # кнопки «Играть!» под старыми картинками работают и после перезапуска
     if not MINIAPP_READY:
-        print("Мини-приложение выключено: нет DISCORD_CLIENT_SECRET в start.bat (или port = 0). /wort не будет работать.")
+        print("Мини-приложение выключено: нет DISCORD_CLIENT_SECRET в start.bat (или port = 0). /wort и /slovo не будут работать.")
         return
     app = web.Application(middlewares=[miniapp_errors])
     app.add_routes([web.get("/", miniapp_index), web.get("/api/config", miniapp_config),

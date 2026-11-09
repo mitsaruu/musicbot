@@ -1,16 +1,31 @@
-// Wortjagd — мини-приложение Discord (Activity).
+// Wortjagd (немецкие слова) и Словечко (русские слова) — мини-приложение Discord (Activity).
 // Связь с Discord — по протоколу Embedded App SDK (сообщения postMessage окну Discord),
 // ходы и проверка слов — на сервере бота (/api/...), поэтому загаданное слово страница не знает.
 "use strict";
 
 const LENGTH = 5;
 const ROWS = 6;
-const KEYS = [
-  ["q", "w", "e", "r", "t", "z", "u", "i", "o", "p", "ü"],
-  ["a", "s", "d", "f", "g", "h", "j", "k", "l", "ö", "ä"],
-  ["enter", "y", "x", "c", "v", "b", "n", "m", "back"],
-];
-const LETTERS = new Set(KEYS.flat().filter((key) => key.length === 1));
+// Всё, что отличается у двух игр: клавиатура и тексты
+const GAMES = {
+  de: {
+    name: "Wortjagd", logo: "W", sub: "Угадай немецкое слово из 5 букв", what: "немецкое",
+    keys: [
+      ["q", "w", "e", "r", "t", "z", "u", "i", "o", "p", "ü"],
+      ["a", "s", "d", "f", "g", "h", "j", "k", "l", "ö", "ä"],
+      ["enter", "y", "x", "c", "v", "b", "n", "m", "back"],
+    ],
+  },
+  ru: {
+    name: "Словечко", logo: "С", sub: "Угадай русское слово из 5 букв", what: "русское",
+    keys: [
+      ["й", "ц", "у", "к", "е", "н", "г", "ш", "щ", "з", "х", "ъ"],
+      ["ф", "ы", "в", "а", "п", "р", "о", "л", "д", "ж", "э"],
+      ["enter", "я", "ч", "с", "м", "и", "т", "ь", "б", "ю", "back"],
+    ],
+  },
+};
+let lang = null;            // какая игра открыта: de или ru
+let LETTERS = new Set();    // буквы этой игры
 
 const params = new URLSearchParams(location.search);
 const boardEl = document.getElementById("board");
@@ -117,9 +132,26 @@ function buildBoard() {
   }
 }
 
+function setLanguage(newLang) {
+  if (newLang === lang || !GAMES[newLang]) return;
+  lang = newLang;
+  const game = GAMES[lang];
+  LETTERS = new Set(game.keys.flat().filter((key) => key.length === 1));
+  document.title = game.name;
+  document.documentElement.lang = lang;
+  document.getElementById("game-logo").textContent = game.logo;
+  document.getElementById("game-name").textContent = game.name;
+  document.getElementById("game-sub").textContent = game.sub;
+  document.getElementById("help-what").textContent = game.what;
+  for (const button of document.querySelectorAll(".lang")) {
+    button.classList.toggle("active", button.dataset.lang === lang);
+  }
+  buildKeyboard();
+}
+
 function buildKeyboard() {
   keyboardEl.innerHTML = "";
-  for (const keys of KEYS) {
+  for (const keys of GAMES[lang].keys) {
     const row = document.createElement("div");
     row.className = "krow";
     for (const key of keys) {
@@ -232,7 +264,8 @@ async function press(key) {
 
 window.addEventListener("keydown", (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
-  const key = event.key.toLowerCase();
+  let key = event.key.toLowerCase();
+  if (key === "ё") key = "е";  // в Словечке ё и е — одна буква
   if (key === "enter") press("enter");
   else if (key === "backspace") press("back");
   else if (LETTERS.has(key)) press(key);
@@ -240,29 +273,38 @@ window.addEventListener("keydown", (event) => {
   event.preventDefault();
 });
 
+async function newGame(body) {
+  if (busy || !session) return;
+  busy = true;
+  try {
+    state = (await api("api/new", body)).state;
+    setLanguage(state.lang);
+    typed = "";
+    render(-1);
+    showGameStatus();
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    busy = false;
+  }
+}
+
 for (const button of document.querySelectorAll(".mode")) {
-  button.addEventListener("click", async () => {
-    if (busy) return;
-    busy = true;
-    try {
-      state = (await api("api/new", { mode: button.dataset.mode })).state;
-      typed = "";
-      render(-1);
-      showGameStatus();
-    } catch (error) {
-      setStatus(error.message, "error");
-    } finally {
-      busy = false;
-    }
+  button.addEventListener("click", () => newGame({ mode: button.dataset.mode }));
+}
+for (const button of document.querySelectorAll(".lang")) {
+  // другая игра — сразу её слово дня
+  button.addEventListener("click", () => {
+    if (button.dataset.lang !== lang) newGame({ mode: "daily", lang: button.dataset.lang });
   });
 }
 
 // ---------- Запуск ----------
 async function start() {
   buildBoard();
-  buildKeyboard();
+  setLanguage("de");
   if (!params.get("frame_id")) {
-    loadingFailed("Эта страница открывается внутри Discord: команда /wort или кнопка запуска приложения.");
+    loadingFailed("Эта страница открывается внутри Discord: команда /wort, /slovo или кнопка запуска приложения.");
     return;
   }
   try {
@@ -280,6 +322,7 @@ async function start() {
     session = login.session;
     await discordCommand("AUTHENTICATE", { access_token: login.access_token }).catch(() => {});
     state = login.state;
+    setLanguage(state.lang);
     render(-1);
     showGameStatus();
     hideSplash();

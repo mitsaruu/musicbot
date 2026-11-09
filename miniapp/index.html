@@ -10,23 +10,28 @@
   <div class="splash" id="splash">
     <div class="splash-center">
       <div class="splash-logo" aria-hidden="true">
-        <span>W</span><span>O</span><span>R</span><span>T</span>
+        <span>W</span><span>С</span><span>Ö</span><span>Л</span>
       </div>
-      <h2>Wortjagd</h2>
+      <h2>Слова из 5 букв</h2>
+      <p class="splash-games">Wortjagd · Словечко</p>
       <p class="splash-text" id="splash-text">Загружаем словарь…</p>
       <div class="progress"><div class="progress-bar" id="progress"></div></div>
-      <p class="tip"><b>Совет:</b> напиши <code>/wort</code> в чате, чтобы играть вместе с друзьями</p>
+      <p class="tip"><b>Совет:</b> напиши <code>/wort</code> (немецкие слова) или <code>/slovo</code> (русские) в чате, чтобы играть вместе с друзьями</p>
     </div>
     <footer class="splash-footer">The BakaSoft Solution Games</footer>
   </div>
   <main id="app">
     <header class="top">
       <div class="brand">
-        <span class="logo">W</span>
+        <span class="logo" id="game-logo">W</span>
         <div>
-          <h1>Wortjagd</h1>
-          <p class="sub">Угадай немецкое слово из 5 букв</p>
+          <h1 id="game-name">Wortjagd</h1>
+          <p class="sub" id="game-sub">Угадай немецкое слово из 5 букв</p>
         </div>
+      </div>
+      <div class="langs" aria-label="Язык">
+        <button class="lang" data-lang="de" title="Wortjagd — немецкие слова">DE</button>
+        <button class="lang" data-lang="ru" title="Словечко — русские слова">RU</button>
       </div>
       <div class="wallet" id="wallet" hidden>🪙 <span id="balance">0</span></div>
     </header>
@@ -44,7 +49,7 @@
 
     <details class="help">
       <summary>Как играть</summary>
-      <p>Введи любое немецкое слово из 5 букв и нажми <b>Enter</b>. Буквы подсветятся:</p>
+      <p>Введи любое <span id="help-what">немецкое</span> слово из 5 букв и нажми <b>Enter</b>. Буквы подсветятся:</p>
       <ul>
         <li><span class="dot correct"></span> буква стоит на своём месте</li>
         <li><span class="dot present"></span> буква есть в слове, но в другом месте</li>

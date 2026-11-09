@@ -44,7 +44,14 @@ html, body {
 }
 h1 { margin: 0; font-size: 20px; letter-spacing: .02em; }
 .sub { margin: 0; font-size: 12px; color: var(--muted); }
-.wallet { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-weight: 600; }
+.wallet { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-weight: 600; white-space: nowrap; }
+.langs { display: flex; gap: 2px; padding: 3px; margin-left: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; }
+.lang {
+  border: 0; border-radius: 999px; padding: 5px 10px; background: transparent; color: var(--muted);
+  font: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
+}
+.lang.active { background: var(--accent); color: #fff; }
+.splash-games { margin: -14px 0 0; color: var(--muted); font-size: 15px; font-weight: 600; }
 
 .modes { display: flex; gap: 8px; }
 .mode {

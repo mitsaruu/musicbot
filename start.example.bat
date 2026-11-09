@@ -6,7 +6,7 @@ set DISCORD_TOKEN=сюда_токен_бота
 set SPOTIFY_CLIENT_ID=сюда_client_id
 set SPOTIFY_CLIENT_SECRET=сюда_client_secret
 set GEMINI_API_KEY=сюда_ключ_gemini
-rem Для мини-приложения /wort: Developer Portal -> OAuth2 -> Client Secret
+rem Для мини-приложения /wort и /slovo: Developer Portal -> OAuth2 -> Client Secret
 set DISCORD_CLIENT_SECRET=сюда_client_secret_приложения
 cd /d "%~dp0"
 py bot.py
