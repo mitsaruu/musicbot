@@ -3250,11 +3250,25 @@ async def sync_commands():
     return len(await bot.http.bulk_upsert_global_commands(app_id, payload=payload)) - len(entry_points)
 
 
+def check_davey():
+    """davey 0.2+ (шифрование звука DAVE) не работает с discord.py 2.7.x: бот «играет», но его не слышно."""
+    try:
+        from importlib.metadata import version
+        davey_version, discord_version = version("davey"), version("discord.py")
+    except Exception:
+        return
+    major_minor = tuple(int(part) for part in re.findall(r"\d+", davey_version)[:2])
+    if major_minor >= (0, 2) and discord_version.startswith("2.7"):
+        print(f"⚠️ davey {davey_version} не работает с discord.py {discord_version} — музыку не будет слышно. "
+              'Исправить: pip install "davey>=0.1.6,<0.2" и перезапустить бота.')
+
+
 @bot.event
 async def setup_hook():
     """Вызывается при запуске бота, до подключения. Здесь регистрируем слэш-команды."""
     synced = await sync_commands()  # отправляем список наших команд в Discord
     print(f"Зарегистрировано слэш-команд: {synced}")
+    check_davey()
     await start_miniapp()           # веб-сервер мини-приложения Wortjagd (если настроено)
     voice_xp_loop.start()           # запускаем начисление опыта за голосовые каналы (раз в минуту)
     daily_loop.start()              # и проверку утренних/вечерних сообщений (раз в минуту)

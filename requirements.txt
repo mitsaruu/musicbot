@@ -1,4 +1,6 @@
 discord.py[voice]>=2.7
+# davey 0.2 несовместим с discord.py 2.7.1: бот «играет», но его никто не слышит (шифрование DAVE не включается)
+davey>=0.1.6,<0.2
 yt-dlp[default]
 spotipy
 Pillow
