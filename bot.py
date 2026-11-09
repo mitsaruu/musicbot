@@ -32,7 +32,7 @@ import re        # "регулярные выражения" — поиск ша
 import sqlite3   # встроенная в Python база данных — в ней храним опыт участников
 import time      # текущее время (для защиты от накрутки опыта)
 import logging   # запись ошибок в файл bot.log
-import shlex       # аккуратно передать FFmpeg заголовки с пробелами и кавычками
+import subprocess  # запуск yt-dlp, который качает звук для FFmpeg
 import tempfile    # временный файл для сообщений FFmpeg
 import sys       # sys.exc_info() — узнать, какая ошибка сейчас случилась
 import traceback # подробности ошибки: в каком файле и на какой строке она произошла
@@ -738,7 +738,7 @@ async def play_next(guild, text_channel):
             now_playing[guild.id] = item  # запоминаем, что сейчас будет играть
             page_url, saved_title = item
             try:
-                stream_url, title, _, headers = await search(page_url)  # получаем свежую ссылку на звук
+                _, title, track_url, _ = await search(page_url)  # проверяем, что трек есть, и узнаём его страницу
                 break                                          # получилось — выходим из цикла
             except Exception:
                 now_playing.pop(guild.id, None)
@@ -750,15 +750,16 @@ async def play_next(guild, text_channel):
                 queue_push_front(guild.id, *item)  # * раскладывает пару (ссылка, название) на два аргумента
             return
 
-        # Создаём источник звука: FFmpeg читает поток по ссылке и превращает его в "сырой" звук (PCM).
-        # Передаём FFmpeg те же заголовки, с которыми yt-dlp получил ссылку, а его ошибки пишем во временный
-        # файл — если трек оборвётся сразу, покажем причину в чате.
-        before = FFMPEG_OPTIONS["before_options"]
-        if headers:
-            header_text = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
-            before += " -headers " + shlex.quote(header_text)  # discord.py разбирает строку через shlex
+        # Создаём источник звука. Звук качает сам yt-dlp и отдаёт его FFmpeg через «трубу» (pipe), а FFmpeg
+        # превращает его в "сырой" звук (PCM). Напрямую по ссылке YouTube на серверах отвечает FFmpeg ошибкой 403,
+        # а yt-dlp — пускает. Сообщения обеих программ пишем во временный файл — если трек оборвётся сразу,
+        # покажем причину в чате.
         ffmpeg_log = tempfile.TemporaryFile()
-        audio = discord.FFmpegPCMAudio(stream_url, before_options=before, options=FFMPEG_OPTIONS["options"],
+        downloader = subprocess.Popen(
+            [sys.executable, "-m", "yt_dlp", "--format", "bestaudio/best", "--no-playlist", "--quiet",
+             "--no-warnings", "--no-part", "--output", "-", track_url],
+            stdout=subprocess.PIPE, stderr=ffmpeg_log)
+        audio = discord.FFmpegPCMAudio(downloader.stdout, pipe=True, options=FFMPEG_OPTIONS["options"],
                                        stderr=ffmpeg_log)
         # PCMVolumeTransformer — "регулятор громкости" поверх звука.
         # volume — множитель: 1.0 = 100%, 0.5 = 50%, 2.0 = 200%. Поэтому делим проценты на 100.
@@ -768,7 +769,7 @@ async def play_next(guild, text_channel):
         # run_coroutine_threadsafe передаёт работу в основной поток бота.
         started = time.monotonic()
         vc.play(source, after=lambda error: asyncio.run_coroutine_threadsafe(
-            on_track_end(guild, text_channel, title, started, ffmpeg_log, error), bot.loop))
+            on_track_end(guild, text_channel, title, started, ffmpeg_log, error, downloader), bot.loop))
 
     await text_channel.send(f"▶️ Играет: **{title}**")
     record_play(guild.id, title)  # засчитываем прослушивание в топ месяца
@@ -777,23 +778,32 @@ async def play_next(guild, text_channel):
 TRACK_TOO_SHORT = 5  # трек «закончился» быстрее стольких секунд — значит, звук не загрузился
 
 
-async def on_track_end(guild, text_channel, title=None, started=None, ffmpeg_log=None, error=None):
+async def on_track_end(guild, text_channel, title=None, started=None, ffmpeg_log=None, error=None, downloader=None):
     """Вызывается, когда трек закончился (или его пропустили). Включает следующий.
-    Если трек оборвался в первые секунды не из-за /skip — пишем в чат и в логи, что сказал FFmpeg."""
+    Если трек оборвался в первые секунды не из-за /skip — пишем в чат и в логи, что сказали yt-dlp и FFmpeg."""
     now_playing.pop(guild.id, None)  # текущий трек больше не играет
+    if downloader is not None and downloader.poll() is None:
+        downloader.kill()  # трек пропустили — yt-dlp больше не нужен, не качаем дальше
+    if downloader is not None:
+        await asyncio.to_thread(downloader.wait)
     skipped = guild.id in skipped_tracks
     skipped_tracks.discard(guild.id)
     if ffmpeg_log is not None:
         try:
             ffmpeg_log.seek(0)
             details = ffmpeg_log.read().decode("utf-8", "replace").strip()
+            details = re.sub(r"https?://\S+?(?=:? |$)", "<ссылка>", details, flags=re.M)  # длинные ссылки прячем
         except Exception:
             details = ""
         ffmpeg_log.close()
         if not skipped and (error or time.monotonic() - started < TRACK_TOO_SHORT):
-            reason = (details.splitlines()[-1] if details else str(error or "FFmpeg ничего не написал"))[:300]
-            print(f"Трек «{title}» не проигрался. FFmpeg:\n{details[-2000:]}")
-            await report_error("Музыка", RuntimeError(f"FFmpeg: {details[-1500:] or error}"), guild, channel=text_channel)
+            lines = details.splitlines()
+            ytdlp_errors = [line for line in lines if line.startswith("ERROR:")]  # причина от yt-dlp — главнее
+            reason = (ytdlp_errors[-1] if ytdlp_errors else lines[-1] if lines else
+                      str(error or "yt-dlp и FFmpeg ничего не написали"))[:300]
+            print(f"Трек «{title}» не проигрался. yt-dlp / FFmpeg:\n{details[-2000:]}")
+            await report_error("Музыка", RuntimeError(f"yt-dlp / FFmpeg: {details[-1500:] or error}"), guild,
+                               channel=text_channel)
             hint = ("Похоже, на сервере нет библиотеки Opus (Linux: `sudo apt install libopus0`)."
                     if error and "opus" in str(error).lower() else
                     "Обычно помогает обновить yt-dlp на сервере: `pip install -U yt-dlp`.")
