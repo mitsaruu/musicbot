@@ -763,22 +763,39 @@ async def play_next(guild, text_channel):
                                        stderr=ffmpeg_log)
         # PCMVolumeTransformer — "регулятор громкости" поверх звука.
         # volume — множитель: 1.0 = 100%, 0.5 = 50%, 2.0 = 200%. Поэтому делим проценты на 100.
-        source = discord.PCMVolumeTransformer(audio, volume=get_volume(guild.id) / 100)
+        source = CountingVolume(audio, volume=get_volume(guild.id) / 100)
 
         # Включаем песню. after вызывается, когда она закончится, — из другого потока, поэтому
         # run_coroutine_threadsafe передаёт работу в основной поток бота.
-        started = time.monotonic()
         vc.play(source, after=lambda error: asyncio.run_coroutine_threadsafe(
-            on_track_end(guild, text_channel, title, started, ffmpeg_log, error, downloader), bot.loop))
+            on_track_end(guild, text_channel, title, source, ffmpeg_log, error, downloader), bot.loop))
 
     await text_channel.send(f"▶️ Играет: **{title}**")
     record_play(guild.id, title)  # засчитываем прослушивание в топ месяца
 
 
-TRACK_TOO_SHORT = 5  # трек «закончился» быстрее стольких секунд — значит, звук не загрузился
+TRACK_TOO_SHORT = 3  # трек «закончился», проиграв меньше стольких секунд звука, — значит, звук не загрузился
 
 
-async def on_track_end(guild, text_channel, title=None, started=None, ffmpeg_log=None, error=None, downloader=None):
+class CountingVolume(discord.PCMVolumeTransformer):
+    """Регулятор громкости, который ещё и считает, сколько звука реально проиграно (кусками по 20 мс).
+    По этому видно, что трек не загрузился, даже если yt-dlp долго думал, прежде чем выдать ошибку."""
+
+    def __init__(self, original, volume=1.0):
+        super().__init__(original, volume=volume)
+        self.frames = 0
+
+    def read(self):
+        data = super().read()
+        if data:
+            self.frames += 1
+        return data
+
+    def seconds(self):
+        return self.frames * 0.02
+
+
+async def on_track_end(guild, text_channel, title=None, source=None, ffmpeg_log=None, error=None, downloader=None):
     """Вызывается, когда трек закончился (или его пропустили). Включает следующий.
     Если трек оборвался в первые секунды не из-за /skip — пишем в чат и в логи, что сказали yt-dlp и FFmpeg."""
     now_playing.pop(guild.id, None)  # текущий трек больше не играет
@@ -796,12 +813,13 @@ async def on_track_end(guild, text_channel, title=None, started=None, ffmpeg_log
         except Exception:
             details = ""
         ffmpeg_log.close()
-        if not skipped and (error or time.monotonic() - started < TRACK_TOO_SHORT):
+        if not skipped and (error or source.seconds() < TRACK_TOO_SHORT):
             lines = details.splitlines()
             ytdlp_errors = [line for line in lines if line.startswith("ERROR:")]  # причина от yt-dlp — главнее
             reason = (ytdlp_errors[-1] if ytdlp_errors else lines[-1] if lines else
                       str(error or "yt-dlp и FFmpeg ничего не написали"))[:300]
-            print(f"Трек «{title}» не проигрался. yt-dlp / FFmpeg:\n{details[-2000:]}")
+            print(f"Трек «{title}» не проигрался (звука: {source.seconds():.1f} с, yt-dlp вышел с кодом "
+                  f"{downloader and downloader.returncode}). yt-dlp / FFmpeg:\n{details[-2000:]}")
             await report_error("Музыка", RuntimeError(f"yt-dlp / FFmpeg: {details[-1500:] or error}"), guild,
                                channel=text_channel)
             hint = ("Похоже, на сервере нет библиотеки Opus (Linux: `sudo apt install libopus0`)."
