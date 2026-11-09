@@ -32,6 +32,8 @@ import re        # "регулярные выражения" — поиск ша
 import sqlite3   # встроенная в Python база данных — в ней храним опыт участников
 import time      # текущее время (для защиты от накрутки опыта)
 import logging   # запись ошибок в файл bot.log
+import shlex       # аккуратно передать FFmpeg заголовки с пробелами и кавычками
+import tempfile    # временный файл для сообщений FFmpeg
 import sys       # sys.exc_info() — узнать, какая ошибка сейчас случилась
 import traceback # подробности ошибки: в каком файле и на какой строке она произошла
 from logging.handlers import RotatingFileHandler  # файл логов, который не разрастается бесконечно
@@ -572,6 +574,9 @@ volumes = {}
 # Нужно, чтобы при /leave вернуть текущий трек в начало сохранённой очереди.
 now_playing = {}
 
+# Серверы, где трек сейчас остановили сами (/skip, /leave) — это не ошибка загрузки звука.
+skipped_tracks = set()
+
 # "Замки" для каждого сервера. Не дают включить два трека одновременно,
 # если play_next вызвали сразу из двух мест (например, /play и окончание песни).
 play_locks = {}
@@ -637,7 +642,8 @@ def queue_clear(guild_id):
 
 
 async def search(query):
-    """Ищет песню через yt-dlp. Возвращает (ссылка_на_звук, название, ссылка_на_страницу_трека)."""
+    """Ищет песню через yt-dlp. Возвращает (ссылка_на_звук, название, ссылка_на_страницу_трека, заголовки).
+    Заголовки (User-Agent и др.) нужны FFmpeg: без них YouTube часто отвечает на ссылку ошибкой 403."""
     loop = asyncio.get_running_loop()  # получаем текущий "цикл событий" бота
 
     def extract():
@@ -650,7 +656,7 @@ async def search(query):
             # Ссылка на звук (info["url"]) через несколько часов перестаёт работать,
             # поэтому в очереди храним ссылку на страницу трека и получаем звук заново перед включением.
             page_url = info.get("webpage_url") or query
-            return info["url"], info.get("title", "Без названия"), page_url
+            return info["url"], info.get("title", "Без названия"), page_url, info.get("http_headers") or {}
 
     # run_in_executor запускает extract() в отдельном потоке и ждёт результат
     return await loop.run_in_executor(None, extract)
@@ -732,7 +738,7 @@ async def play_next(guild, text_channel):
             now_playing[guild.id] = item  # запоминаем, что сейчас будет играть
             page_url, saved_title = item
             try:
-                stream_url, title, _ = await search(page_url)  # получаем свежую ссылку на звук
+                stream_url, title, _, headers = await search(page_url)  # получаем свежую ссылку на звук
                 break                                          # получилось — выходим из цикла
             except Exception:
                 now_playing.pop(guild.id, None)
@@ -745,23 +751,53 @@ async def play_next(guild, text_channel):
             return
 
         # Создаём источник звука: FFmpeg читает поток по ссылке и превращает его в "сырой" звук (PCM).
-        audio = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
+        # Передаём FFmpeg те же заголовки, с которыми yt-dlp получил ссылку, а его ошибки пишем во временный
+        # файл — если трек оборвётся сразу, покажем причину в чате.
+        before = FFMPEG_OPTIONS["before_options"]
+        if headers:
+            header_text = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+            before += " -headers " + shlex.quote(header_text)  # discord.py разбирает строку через shlex
+        ffmpeg_log = tempfile.TemporaryFile()
+        audio = discord.FFmpegPCMAudio(stream_url, before_options=before, options=FFMPEG_OPTIONS["options"],
+                                       stderr=ffmpeg_log)
         # PCMVolumeTransformer — "регулятор громкости" поверх звука.
         # volume — множитель: 1.0 = 100%, 0.5 = 50%, 2.0 = 200%. Поэтому делим проценты на 100.
         source = discord.PCMVolumeTransformer(audio, volume=get_volume(guild.id) / 100)
 
         # Включаем песню. after вызывается, когда она закончится, — из другого потока, поэтому
         # run_coroutine_threadsafe передаёт работу в основной поток бота.
+        started = time.monotonic()
         vc.play(source, after=lambda error: asyncio.run_coroutine_threadsafe(
-            on_track_end(guild, text_channel), bot.loop))
+            on_track_end(guild, text_channel, title, started, ffmpeg_log, error), bot.loop))
 
     await text_channel.send(f"▶️ Играет: **{title}**")
     record_play(guild.id, title)  # засчитываем прослушивание в топ месяца
 
 
-async def on_track_end(guild, text_channel):
-    """Вызывается, когда трек закончился (или его пропустили). Включает следующий."""
+TRACK_TOO_SHORT = 5  # трек «закончился» быстрее стольких секунд — значит, звук не загрузился
+
+
+async def on_track_end(guild, text_channel, title=None, started=None, ffmpeg_log=None, error=None):
+    """Вызывается, когда трек закончился (или его пропустили). Включает следующий.
+    Если трек оборвался в первые секунды не из-за /skip — пишем в чат и в логи, что сказал FFmpeg."""
     now_playing.pop(guild.id, None)  # текущий трек больше не играет
+    skipped = guild.id in skipped_tracks
+    skipped_tracks.discard(guild.id)
+    if ffmpeg_log is not None:
+        try:
+            ffmpeg_log.seek(0)
+            details = ffmpeg_log.read().decode("utf-8", "replace").strip()
+        except Exception:
+            details = ""
+        ffmpeg_log.close()
+        if not skipped and (error or time.monotonic() - started < TRACK_TOO_SHORT):
+            reason = (details.splitlines()[-1] if details else str(error or "FFmpeg ничего не написал"))[:300]
+            print(f"Трек «{title}» не проигрался. FFmpeg:\n{details[-2000:]}")
+            await report_error("Музыка", RuntimeError(f"FFmpeg: {details[-1500:] or error}"), guild, channel=text_channel)
+            hint = ("Похоже, на сервере нет библиотеки Opus (Linux: `sudo apt install libopus0`)."
+                    if error and "opus" in str(error).lower() else
+                    "Обычно помогает обновить yt-dlp на сервере: `pip install -U yt-dlp`.")
+            await text_channel.send(f"⚠️ **{title}** не проигрался: `{reason}`\n{hint}")
     await play_next(guild, text_channel)
 
 
@@ -3273,7 +3309,7 @@ async def play(interaction: discord.Interaction, query: str):
         query = queries[0]
 
     try:
-        _, title, page_url = await search(query)  # ищем песню (ссылка на звук сейчас не нужна — "_")
+        _, title, page_url, _ = await search(query)  # ищем песню (ссылка на звук сейчас не нужна — "_")
     except Exception:
         await interaction.followup.send("Не получилось найти или загрузить этот трек.")
         return
@@ -3299,6 +3335,7 @@ async def play(interaction: discord.Interaction, query: str):
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
+        skipped_tracks.add(interaction.guild.id)  # это не ошибка звука — не пишем «не проигрался»
         vc.stop()  # остановка песни вызывает after → play_next включит следующую
         await interaction.response.send_message("⏭️ Пропущено.")
     else:
@@ -4392,6 +4429,7 @@ async def leave(interaction: discord.Interaction):
     current = now_playing.pop(interaction.guild.id, None)  # что играло в момент выхода
     if current:
         queue_push_front(interaction.guild.id, *current)   # возвращаем его в начало очереди — сыграет первым
+    skipped_tracks.add(interaction.guild.id)
     await vc.disconnect()
 
     saved = queue_count(interaction.guild.id)
