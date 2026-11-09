@@ -255,6 +255,8 @@ python bot.py
    3. В Developer Portal → **Activities → URL Mappings**: в строку с префиксом `/` впишите адрес туннеля
       **без** `https://` (например, `что-то.trycloudflare.com`).
    4. **Activities → Settings**: включите **Enable Activities**. Discord сам создаст команду запуска приложения.
+      Там же в **Supported Platforms** включите **Web** (это и приложение на ПК), **iOS** и **Android** —
+      иначе на неотмеченных устройствах будет ошибка 50231 «not configured to support the user's current client platform».
    5. Перезапустите бота. Теперь `/wort` и кнопка «Играть!» открывают мини-приложение.
       Ещё его можно запустить из меню приложений в голосовом канале или чате.
 

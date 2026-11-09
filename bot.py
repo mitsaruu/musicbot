@@ -4809,11 +4809,19 @@ async def open_word_miniapp(interaction):
         return
     try:
         await interaction.response.launch_activity()  # Discord откроет игру
+        return
     except discord.HTTPException as error:
         print("Не получилось открыть мини-приложение:", error)
-        await interaction.response.send_message(
-            "🧩 Мини-приложение не открылось. Админу: проверь, что в Developer Portal включены Activities "
-            "(инструкция в README).", ephemeral=True)
+        if error.code == 50231:  # в настройках Activity не включена эта платформа (ПК, телефон)
+            text = ("🧩 Мини-приложение пока не работает на твоём устройстве. Админу: Developer Portal → Activities → "
+                    "Settings → Supported Platforms — включить Web (это и ПК), iOS и Android.")
+        else:
+            text = ("🧩 Мини-приложение не открылось. Админу: проверь, что в Developer Portal включены Activities "
+                    "(инструкция в README).")
+    try:
+        await interaction.response.send_message(text, ephemeral=True)
+    except discord.HTTPException:
+        pass  # Discord уже не ждёт ответа на эту команду — подсказка останется в консоли
 
 
 @bot.tree.command(name="wort", description="Wortjagd: угадай немецкое слово из 5 букв (мини-приложение)")
