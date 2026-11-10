@@ -180,6 +180,13 @@ work_max = 400
 work_cooldown_hours = 8
 ; Минимальная ставка в играх
 min_bet = 10
+; Ежедневный бонус /daily: сколько монет в первый день, на сколько он растёт за каждый следующий день подряд
+; и после скольких дней подряд перестаёт расти (пропустил день — серия начинается заново)
+daily_bonus = 200
+daily_streak_bonus = 50
+daily_streak_max = 7
+; По какому часовому поясу считаются дни для /daily
+timezone = Europe/Moscow
 
 [pets]
 ; Питомцы из кейсов (/case): каждый сам приносит монеты в час, их забирают командой /pets_collect.
@@ -204,7 +211,7 @@ growth_cooldown_hours = 24
 [channels]
 ; Команды, которые работают только в канале для игр (его выбирают в Discord командой /games_channel).
 ; Пиши названия через запятую. Пока канал не выбран, все команды работают везде.
-games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, predskazanie, shar, wort, slovo
+games_commands = rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, dice, roll, predskazanie, shar, wort, slovo, daily, shop, shop_buy, pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz
 
 [moderation]
 ; Тайм-ауты за грубость к боту (мат, оскорбления, непотребства). Первый раз бот просто молчит,
@@ -251,6 +258,27 @@ announce = on
 ; port = 0 — выключить мини-приложение (и игры /wort и /slovo)
 host = 127.0.0.1
 port = 8080
+
+[welcome]
+; Приветствие новых участников (канал выбирают командой /welcome_channel). Боту нужно разрешение
+; Server Members Intent: сначала включи его в Developer Portal (вкладка Bot), потом поставь здесь on.
+; Если поставить on, не включив в Developer Portal, — бот не запустится.
+members_intent = off
+
+[antispam]
+; Анти-спам: за спам бот удаляет сообщения и выдаёт варн (варны сами ведут к тайм-ауту, см. warn_punishments).
+; Модераторов не трогает. on или off
+enabled = on
+; Сколько одинаковых сообщений подряд считать спамом и сколько сообщений со ссылками подряд
+same_messages = 4
+link_messages = 4
+; За сколько секунд их считать
+window_seconds = 20
+
+[quiz]
+; Викторина /quiz: монет за правильный ответ и сколько секунд даётся на ответ
+reward = 100
+seconds = 30
 
 [names]
 ; Как зовут бота в чате (через запятую). На приветствие с этими именами («привет малфоид») бот отвечает,
@@ -411,7 +439,8 @@ def is_rude(text):
 DEFAULT_GAMES_COMMANDS = ("rank, leaderboard, top_chart_month, money_leaderboard, "
                           "dick_growth, dick_size, dick_leaderboard, work, balance, give_money, "
                           "coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, "
-                          "dice, roll, predskazanie, shar, wort, slovo")
+                          "dice, roll, predskazanie, shar, wort, slovo, daily, shop, shop_buy, "
+                          "pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz")
 GAMES_COMMANDS = {name.strip().lstrip("/").lower()
                   for name in setting("channels", "games_commands", DEFAULT_GAMES_COMMANDS).split(",")
                   if name.strip()}
@@ -493,6 +522,11 @@ FFMPEG_OPTIONS = {
 # "Intents" — разрешения на то, какие события бот получает от Discord.
 intents = discord.Intents.default()  # стандартный набор (в нём есть и голосовые каналы)
 intents.message_content = True       # разрешаем читать текст сообщений — нужно для автоответов
+# Приветствие новичков: боту нужно знать, кто зашёл на сервер. Это отдельное разрешение — его сначала включают
+# в Developer Portal (Bot → Server Members Intent), потом здесь: settings.ini, [welcome] members_intent = on.
+# Если включить только здесь — бот не запустится.
+MEMBERS_INTENT = setting("welcome", "members_intent", "off").lower() in ("on", "да", "yes", "1")
+intents.members = MEMBERS_INTENT
                                      # (в Developer Portal должен быть включён Message Content Intent)
 
 class BotTree(app_commands.CommandTree):
@@ -580,6 +614,11 @@ now_playing = {}
 
 # Серверы, где трек сейчас остановили сами (/skip, /leave) — это не ошибка загрузки звука.
 skipped_tracks = set()
+
+# Ссылка на страницу трека, который сейчас играет (для автоплея): id сервера → ссылка.
+playing_urls = {}
+# Серверы, где включён повтор текущего трека (кнопка 🔁). После перезапуска бота — выключен.
+repeat_on = set()
 
 # "Замки" для каждого сервера. Не дают включить два трека одновременно,
 # если play_next вызвали сразу из двух мест (например, /play и окончание песни).
@@ -743,6 +782,7 @@ async def play_next(guild, text_channel):
             page_url, saved_title = item
             try:
                 _, title, track_url, _ = await search(page_url)  # проверяем, что трек есть, и узнаём его страницу
+                playing_urls[guild.id] = track_url
                 break                                          # получилось — выходим из цикла
             except Exception:
                 now_playing.pop(guild.id, None)
@@ -774,7 +814,7 @@ async def play_next(guild, text_channel):
         vc.play(source, after=lambda error: asyncio.run_coroutine_threadsafe(
             on_track_end(guild, text_channel, title, source, ffmpeg_log, error, downloader), bot.loop))
 
-    await text_channel.send(f"▶️ Играет: **{title}**")
+    await text_channel.send(f"▶️ Играет: **{title}**", view=MusicControls())  # кнопки: пауза, дальше, повтор...
     record_play(guild.id, title)  # засчитываем прослушивание в топ месяца
 
 
@@ -802,7 +842,9 @@ class CountingVolume(discord.PCMVolumeTransformer):
 async def on_track_end(guild, text_channel, title=None, source=None, ffmpeg_log=None, error=None, downloader=None):
     """Вызывается, когда трек закончился (или его пропустили). Включает следующий.
     Если трек оборвался в первые секунды не из-за /skip — пишем в чат и в логи, что сказали yt-dlp и FFmpeg."""
-    now_playing.pop(guild.id, None)  # текущий трек больше не играет
+    played = now_playing.pop(guild.id, None)  # текущий трек больше не играет
+    played_url = playing_urls.pop(guild.id, None)
+    failed = False
     if downloader is not None and downloader.poll() is None:
         downloader.kill()  # трек пропустили — yt-dlp больше не нужен, не качаем дальше
     if downloader is not None:
@@ -818,6 +860,7 @@ async def on_track_end(guild, text_channel, title=None, source=None, ffmpeg_log=
             details = ""
         ffmpeg_log.close()
         if not skipped and (error or source.seconds() < TRACK_TOO_SHORT):
+            failed = True
             lines = details.splitlines()
             ytdlp_errors = [line for line in lines if line.startswith("ERROR:")]  # причина от yt-dlp — главнее
             reason = (ytdlp_errors[-1] if ytdlp_errors else lines[-1] if lines else
@@ -830,6 +873,10 @@ async def on_track_end(guild, text_channel, title=None, source=None, ffmpeg_log=
                     if error and "opus" in str(error).lower() else
                     "Обычно помогает обновить yt-dlp на сервере: `pip install -U yt-dlp`.")
             await text_channel.send(f"⚠️ **{title}** не проигрался: `{reason}`\n{hint}")
+    if played and not skipped and not failed and guild.id in repeat_on:
+        queue_push_front(guild.id, *played)  # повтор включён — тот же трек снова первым в очереди
+    elif played_url and not failed and queue_count(guild.id) == 0:
+        await autoplay_add(guild, text_channel, played_url)  # очередь кончилась — похожий трек (если включено)
     await play_next(guild, text_channel)
 
 
@@ -3255,6 +3302,8 @@ async def on_message(message):
     if isinstance(message.author, discord.Member):
         remember_names(message.author)  # чтобы узнавать его имя в чужих приветствиях («привет саня»)
     last_activity[message.guild.id] = (message.channel.id, time.time())  # здесь сейчас общаются (для реплик)
+    if await check_spam(message):  # спам — сообщения удалены, человеку выдан варн
+        return
     if ai_client and is_addressed_to_bot(message):  # к боту обратились — отвечает ИИ
         await ai_reply(message)
     else:
@@ -3300,6 +3349,10 @@ async def setup_hook():
     voice_xp_loop.start()           # запускаем начисление опыта за голосовые каналы (раз в минуту)
     daily_loop.start()              # и проверку утренних/вечерних сообщений (раз в минуту)
     chatter_loop.start()            # и случайные реплики по теме чата (раз в CHATTER_INTERVAL минут)
+    bot.add_view(MusicControls())   # кнопки под «Играет» работают и после перезапуска
+    bot.add_view(PollView())        # и кнопки опросов
+    fast_loop.start()               # напоминания и опросы (раз в 20 секунд)
+    slow_loop.start()               # роли из магазина и дуэли в словах (раз в 10 минут)
 
 
 patchnotes_done = False  # уже проверили патчноуты в этом запуске
@@ -4132,10 +4185,11 @@ def pet_pending(species, level, last_collect, now=None):
 
 
 def user_pets(guild_id, user_id):
-    """Питомцы человека по порядку: список (id, species, level, last_collect, spent)."""
+    """Питомцы человека: список (id, species, level, last_collect, spent), от самого доходного к самому слабому."""
     rows = db.execute("SELECT id, species, level, last_collect, spent FROM pets "
                       "WHERE guild_id = ? AND user_id = ? ORDER BY id", (guild_id, user_id)).fetchall()
-    return [row for row in rows if row[1] in PET_SPECIES]  # вид, которого больше нет в списке, пропускаем
+    rows = [row for row in rows if row[1] in PET_SPECIES]  # вид, которого больше нет в списке, пропускаем
+    return sorted(rows, key=lambda row: -pet_income(row[1], row[2]))  # при равном доходе — кто раньше появился
 
 
 def roll_pet(case_kind):
@@ -4778,6 +4832,8 @@ async def make_word_guess(guild_id, member, text, lang):
             game.reward = info["rewards"][min(len(game.guesses), len(info["rewards"])) - 1]
             if game.reward:
                 add_money(guild_id, member, game.reward)
+        if game.finished:
+            asyncio.create_task(resolve_word_duels())  # вдруг у него дуэль на это слово
     return game, None
 
 
@@ -5015,6 +5071,230 @@ async def wort(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def slovo(interaction: discord.Interaction):
     await open_word_miniapp(interaction, "ru")
+
+
+# ---------- Статистика, таблица месяца и дуэли ----------
+WORD_GAME_CHOICES = [app_commands.Choice(name=f"{info['name']} ({info['what']})", value=lang)
+                     for lang, info in WORD_LANGS.items()]
+
+
+def word_results(guild_id, lang, user_id=None, month=None):
+    """Законченные партии слова дня: список (участник, день, попыток или None, если не угадал), по дням.
+    user_id — только этого участника, month — только за месяц вида "2026-11"."""
+    query = f"SELECT user_id, day, answer, guesses FROM {WORD_LANGS[lang]['table']} WHERE guild_id = ? AND guesses != ''"
+    args = [guild_id]
+    if user_id is not None:
+        query, args = query + " AND user_id = ?", args + [user_id]
+    if month:
+        query, args = query + " AND day LIKE ?", args + [month + "-%"]
+    results = []
+    for player, day, answer, guesses in db.execute(query + " ORDER BY day", args):
+        guesses = guesses.split(",")
+        if guesses[-1] == answer:
+            results.append((player, day, len(guesses)))
+        elif len(guesses) >= MAX_GUESSES:
+            results.append((player, day, None))
+    return results
+
+
+def win_streaks(days_won, today):
+    """По списку дней с победой: (текущая серия дней подряд, лучшая серия). Текущая считается, если последняя
+    победа была сегодня или вчера."""
+    dates = sorted({datetime.date.fromisoformat(day) for day in days_won})
+    best = current = run = 0
+    previous = None
+    for date in dates:
+        run = run + 1 if previous and (date - previous).days == 1 else 1
+        best, previous = max(best, run), date
+    if dates and (datetime.date.fromisoformat(today) - dates[-1]).days <= 1:
+        current = run
+    return current, best
+
+
+@bot.tree.command(name="wordstats", description="Твоя статистика в Wortjagd и «5 букв»")
+@app_commands.describe(member="Чью статистику показать (если не выбрать — твою)")
+@app_commands.guild_only()
+async def wordstats(interaction: discord.Interaction, member: discord.Member | None = None):
+    member = member or interaction.user
+    embed = discord.Embed(color=0x3B9A68, title=f"🧩 Статистика слов — {member.display_name}")
+    for lang, info in WORD_LANGS.items():
+        results = word_results(interaction.guild_id, lang, member.id)
+        if not results:
+            embed.add_field(name=info["name"], value=f"Ещё не играл(а). Начать — {info['command']}", inline=False)
+            continue
+        wins = [tries for _, _, tries in results if tries]
+        current, best = win_streaks([day for _, day, tries in results if tries], word_today(lang))
+        biggest = max([wins.count(tries) for tries in range(1, MAX_GUESSES + 1)] + [1])
+        bars = "\n".join(f"`{tries}` {'█' * round(8 * wins.count(tries) / biggest) or '▏'} {wins.count(tries)}"
+                         for tries in range(1, MAX_GUESSES + 1))
+        average = f", в среднем с {sum(wins) / len(wins):.1f}-й попытки".replace(".", ",") if wins else ""
+        embed.add_field(
+            name=info["name"], inline=False,
+            value=f"Сыграно: **{len(results)}** · побед: **{len(wins)}** ({round(100 * len(wins) / len(results))}%){average}\n"
+                  f"🔥 Серия побед: **{current}** · лучшая: **{best}**\n{bars}")
+    await interaction.response.send_message(embed=embed, allowed_mentions=NO_PINGS)
+
+
+def word_points(tries):
+    """Очки за слово дня: с 1-й попытки — 6, со 2-й — 5 ... с 6-й — 1, не угадал — 0."""
+    return MAX_GUESSES + 1 - tries if tries else 0
+
+
+@bot.tree.command(name="wordtop", description="Лучшие игроки месяца в Wortjagd или «5 букв» (топ-10)")
+@app_commands.describe(game="Какая игра")
+@app_commands.choices(game=WORD_GAME_CHOICES)
+@app_commands.guild_only()
+async def wordtop(interaction: discord.Interaction, game: app_commands.Choice[str]):
+    lang = game.value
+    info = WORD_LANGS[lang]
+    month = word_today(lang)[:7]
+    totals = {}  # участник → [очки, побед, игр]
+    for user_id, _, tries in word_results(interaction.guild_id, lang, month=month):
+        total = totals.setdefault(user_id, [0, 0, 0])
+        total[0] += word_points(tries)
+        total[1] += bool(tries)
+        total[2] += 1
+    top = sorted(totals.items(), key=lambda item: (-item[1][0], -item[1][1]))[:10]
+    if not top:
+        await interaction.response.send_message(f"В этом месяце в {info['name']} ещё никто не играл — {info['command']}!")
+        return
+    await interaction.response.defer()
+    best = top[0][1][0] or 1
+    rows = []
+    for user_id, (points, wins, games) in top:
+        member = await word_member(interaction.guild, user_id)
+        rows.append({"name": member.display_name if member else f"Участник {user_id}",
+                     "avatar": await get_avatar_by_id(interaction.guild, user_id),
+                     "progress": points / best, "pill": number(points),
+                     "hint": f"побед {wins} из {games}"})
+    loop = asyncio.get_running_loop()
+    image = await loop.run_in_executor(None, make_table_image, info["name"].upper(), interaction.guild.name,
+                                       f"ТОП {len(rows)}", "очки за месяц", rows, pick_background("leaderboard"))
+    await interaction.followup.send(file=discord.File(image, filename="wordtop.png"))
+
+
+# Дуэль: двое ставят монеты на сегодняшнее слово дня. Кто отгадает за меньшее число попыток — забирает всё.
+db.execute("""
+    CREATE TABLE IF NOT EXISTS word_duels (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id   INTEGER,
+        channel_id INTEGER,   -- где объявить итог
+        lang       TEXT,
+        day        TEXT,      -- слово какого дня
+        user1      INTEGER,
+        user2      INTEGER,
+        bet        INTEGER
+    )
+""")
+db.commit()
+
+
+def duel_tries(guild_id, lang, day, user_id, day_over):
+    """Результат участника в слове дня: число попыток, MAX_GUESSES + 1 — не угадал, None — ещё играет.
+    day_over — день уже кончился: кто не доиграл, тот не угадал."""
+    row = db.execute(f"SELECT answer, guesses FROM {WORD_LANGS[lang]['table']} "
+                     "WHERE guild_id = ? AND user_id = ? AND day = ?", (guild_id, user_id, day)).fetchone()
+    guesses = [guess for guess in row[1].split(",") if guess] if row else []
+    if guesses and guesses[-1] == row[0]:
+        return len(guesses)
+    if len(guesses) >= MAX_GUESSES or day_over:
+        return MAX_GUESSES + 1
+    return None
+
+
+async def resolve_word_duels():
+    """Подводит итоги дуэлей, где оба доиграли слово дня (или день уже кончился)."""
+    for duel_id, guild_id, channel_id, lang, day, user1, user2, bet in db.execute(
+            "SELECT id, guild_id, channel_id, lang, day, user1, user2, bet FROM word_duels").fetchall():
+        day_over = day < word_today(lang)
+        first, second = (duel_tries(guild_id, lang, day, user, day_over) for user in (user1, user2))
+        if first is None or second is None:
+            continue  # кто-то ещё играет
+        if db.execute("DELETE FROM word_duels WHERE id = ?", (duel_id,)).rowcount == 0:
+            continue  # эту дуэль уже посчитали
+        db.commit()
+        name = WORD_LANGS[lang]["name"]
+
+        def score(tries):
+            return f"{tries}/{MAX_GUESSES}" if tries <= MAX_GUESSES else f"X/{MAX_GUESSES}"
+
+        if first == second:  # ничья — ставки возвращаются
+            add_money_id(guild_id, user1, bet)
+            add_money_id(guild_id, user2, bet)
+            text = (f"🤝 Дуэль в {name}: <@{user1}> и <@{user2}> сыграли одинаково ({score(first)}) — "
+                    f"ставки по {money_text(bet)} возвращены.")
+        else:
+            winner, loser = (user1, user2) if first < second else (user2, user1)
+            add_money_id(guild_id, winner, bet * 2)
+            text = (f"🏆 Дуэль в {name}: <@{winner}> ({score(min(first, second))}) побеждает <@{loser}> "
+                    f"({score(max(first, second))}) и забирает **{money_text(bet * 2)}**!")
+        channel = bot.get_channel(channel_id)
+        if channel:
+            try:
+                await channel.send(text, allowed_mentions=NO_PINGS)
+            except discord.HTTPException:
+                pass
+
+
+@bot.tree.command(name="wordduel", description="Дуэль на монеты: кто отгадает сегодняшнее слово дня за меньше попыток")
+@app_commands.describe(member="Кого вызвать", game="В какой игре", bet="Ставка в монетах")
+@app_commands.choices(game=WORD_GAME_CHOICES)
+@app_commands.guild_only()
+async def wordduel(interaction: discord.Interaction, member: discord.Member, game: app_commands.Choice[str],
+                   bet: app_commands.Range[int, 1, MAX_BET]):
+    challenger, guild_id, lang = interaction.user, interaction.guild_id, game.value
+    info, day = WORD_LANGS[lang], word_today(lang)
+
+    def started(user_id):  # уже делал ходы в сегодняшнем слове — дуэль была бы нечестной
+        row = db.execute(f"SELECT guesses FROM {info['table']} WHERE guild_id = ? AND user_id = ? AND day = ?",
+                         (guild_id, user_id, day)).fetchone()
+        return bool(row and row[0])
+
+    def in_duel(user_id):
+        return db.execute("SELECT 1 FROM word_duels WHERE guild_id = ? AND lang = ? AND day = ? AND ? IN (user1, user2)",
+                          (guild_id, lang, day, user_id)).fetchone()
+
+    if member.bot or member.id == challenger.id:
+        await interaction.response.send_message("Вызови на дуэль другого участника (не бота и не себя).", ephemeral=True)
+        return
+    if started(challenger.id) or started(member.id):
+        await interaction.response.send_message(
+            f"Дуэль честная, только если оба ещё не начинали сегодняшнее слово в {info['name']}. Попробуйте завтра.",
+            ephemeral=True)
+        return
+    if in_duel(challenger.id) or in_duel(member.id):
+        await interaction.response.send_message("У кого-то из вас уже есть дуэль на сегодняшнее слово.", ephemeral=True)
+        return
+    if bet < MIN_BET or get_wallet(guild_id, challenger)[0] < bet:
+        await interaction.response.send_message(
+            f"Ставка — от {money_text(MIN_BET)}, и у тебя должно хватать монет.", ephemeral=True)
+        return
+
+    async def begin(accept: discord.Interaction):
+        if (started(challenger.id) or started(member.id) or in_duel(challenger.id) or in_duel(member.id)
+                or word_today(lang) != day):
+            await accept.response.edit_message(content="Дуэль отменена: кто-то уже начал слово дня.", view=None)
+            return
+        if get_wallet(guild_id, challenger)[0] < bet or get_wallet(guild_id, member)[0] < bet:
+            await accept.response.edit_message(content=f"Дуэль отменена: кому-то не хватает {money_text(bet)}.",
+                                               view=None)
+            return
+        add_money(guild_id, challenger, -bet)
+        add_money(guild_id, member, -bet)
+        db.execute("INSERT INTO word_duels (guild_id, channel_id, lang, day, user1, user2, bet) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (guild_id, interaction.channel_id, lang, day, challenger.id, member.id, bet))
+        db.commit()
+        await accept.response.edit_message(
+            content=f"⚔️ Дуэль в {info['name']}: {challenger.mention} против {member.mention}, на кону "
+                    f"**{money_text(bet * 2)}**. Открывайте {info['command']} и отгадывайте сегодняшнее слово — "
+                    f"победит тот, кому хватит меньше попыток. Кто не доиграет до конца дня — проиграл.",
+            view=None, allowed_mentions=NO_PINGS)
+
+    await send_challenge(
+        interaction, member,
+        f"⚔️ {member.mention}, {challenger.mention} вызывает тебя на дуэль в {info['name']}: кто отгадает сегодняшнее "
+        f"слово дня за меньше попыток. Ставка — **{money_text(bet)}** с каждого.", begin)
 
 
 # ---------- Мини-приложение (Discord Activity) ----------
@@ -5340,6 +5620,1244 @@ async def set_patchnotes_channel(interaction: discord.Interaction, channel: disc
         ephemeral=True)
     if latest:
         await channel.send(embed=patchnote_embed(latest))  # сразу показываем последний — чтобы было видно, как выглядит
+
+
+# ============================================================
+#  ОБЩЕЕ ДЛЯ НОВЫХ КОМАНД
+# ============================================================
+import urllib.parse  # ссылка на поиск текста песни
+import json as _json  # опросы хранят варианты ответа в базе в виде JSON
+
+
+class ConfirmView(discord.ui.View):
+    """Кнопки «Принять» / «Отказаться» для вызова: бой питомцев, обмен, дуэль в словах.
+    Нажать может только тот, кого позвали. on_accept — что сделать при согласии (получает interaction)."""
+
+    def __init__(self, target, on_accept, timeout=120):
+        super().__init__(timeout=timeout)
+        self.target, self.on_accept, self.message = target, on_accept, None
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.target.id:
+            await interaction.response.send_message("Это предложение не тебе 🙂", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Принять", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await self.on_accept(interaction)
+
+    @discord.ui.button(label="Отказаться", style=discord.ButtonStyle.secondary)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content=f"🙅 {self.target.mention} отказывается.", view=None,
+                                                allowed_mentions=NO_PINGS)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(content=f"⌛ {self.target.mention} не ответил — предложение отменено.",
+                                        view=None, allowed_mentions=NO_PINGS)
+            except discord.HTTPException:
+                pass
+
+
+async def send_challenge(interaction, target, text, on_accept):
+    """Отправляет предложение с кнопками и запоминает сообщение (чтобы убрать кнопки, если не ответят)."""
+    view = ConfirmView(target, on_accept)
+    await interaction.response.send_message(text, view=view, allowed_mentions=discord.AllowedMentions(users=[target]))
+    view.message = await interaction.original_response()
+
+
+def add_money_id(guild_id, user_id, amount):
+    """Как add_money, но по id участника (когда самого участника под рукой нет). Кошелёк уже должен быть."""
+    db.execute("UPDATE economy SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
+               (amount, guild_id, user_id))
+    db.commit()
+
+
+ECONOMY_TIMEZONE = setting("economy", "timezone", "Europe/Moscow")  # по какому времени считаются «дни» бонуса
+
+
+def economy_today():
+    return datetime.datetime.now(zone(ECONOMY_TIMEZONE)).date()
+
+
+# ============================================================
+#  ЕЖЕДНЕВНЫЙ БОНУС (/daily)
+#  Раз в день можно забрать монеты. Заходишь каждый день подряд — бонус растёт (до daily_streak_max дней).
+#  Пропустил день — серия начинается заново. Настройки — settings.ini, раздел [economy].
+# ============================================================
+DAILY_BONUS = max(0, setting("economy", "daily_bonus", 200))               # монет в первый день
+DAILY_STREAK_BONUS = max(0, setting("economy", "daily_streak_bonus", 50))  # прибавка за каждый следующий день подряд
+DAILY_STREAK_MAX = max(1, setting("economy", "daily_streak_max", 7))       # после стольких дней бонус не растёт
+
+db.execute("""
+    CREATE TABLE IF NOT EXISTS daily_bonus (
+        guild_id INTEGER,
+        user_id  INTEGER,
+        last_day TEXT,      -- когда последний раз забирал бонус, например "2026-11-10"
+        streak   INTEGER,   -- сколько дней подряд
+        PRIMARY KEY (guild_id, user_id)
+    )
+""")
+db.commit()
+
+
+def daily_reward(streak):
+    return DAILY_BONUS + DAILY_STREAK_BONUS * (min(streak, DAILY_STREAK_MAX) - 1)
+
+
+@bot.tree.command(name="daily", description="Забрать ежедневный бонус (каждый день подряд — больше)")
+@app_commands.guild_only()
+async def daily_bonus(interaction: discord.Interaction):
+    today = economy_today()
+    row = db.execute("SELECT last_day, streak FROM daily_bonus WHERE guild_id = ? AND user_id = ?",
+                     (interaction.guild_id, interaction.user.id)).fetchone()
+    last_day, streak = row if row else (None, 0)
+    if last_day == today.isoformat():
+        tomorrow = datetime.datetime.combine(today + datetime.timedelta(days=1), datetime.time(), zone(ECONOMY_TIMEZONE))
+        await interaction.response.send_message(
+            f"🎁 Сегодняшний бонус уже забран. Следующий — <t:{int(tomorrow.timestamp())}:R> "
+            f"(+{money_text(daily_reward(streak + 1))}).", ephemeral=True)
+        return
+    yesterday = (today - datetime.timedelta(days=1)).isoformat()
+    streak = streak + 1 if last_day == yesterday else 1  # пропустил день — серия заново
+    reward = daily_reward(streak)
+    db.execute("""
+        INSERT INTO daily_bonus (guild_id, user_id, last_day, streak) VALUES (?, ?, ?, ?)
+        ON CONFLICT (guild_id, user_id) DO UPDATE SET last_day = excluded.last_day, streak = excluded.streak
+    """, (interaction.guild_id, interaction.user.id, today.isoformat(), streak))
+    balance = add_money(interaction.guild_id, interaction.user, reward)
+    text = (f"🎁 {interaction.user.mention} забирает ежедневный бонус: **+{money_text(reward)}**. "
+            f"Баланс: **{money_text(balance)}**.\n🔥 Дней подряд: **{streak}**")
+    if streak < DAILY_STREAK_MAX:
+        text += f" — завтра будет +{money_text(daily_reward(streak + 1))}."
+    else:
+        text += " — это максимальный бонус, главное не пропускать."
+    await interaction.response.send_message(text, allowed_mentions=NO_PINGS)
+
+
+# ============================================================
+#  МАГАЗИН РОЛЕЙ (/shop, /shop_buy, для админов — /shop_add и /shop_remove)
+#  Админ выставляет роль на продажу: цена и на сколько дней (0 — навсегда). Участник покупает её за монеты.
+#  Роль на время бот снимает сам, когда срок выйдет. Боту нужно право «Управлять ролями», и его роль должна
+#  быть выше продаваемых.
+# ============================================================
+db.execute("""
+    CREATE TABLE IF NOT EXISTS shop_roles (
+        guild_id INTEGER,
+        role_id  INTEGER,
+        price    INTEGER,
+        days     INTEGER,   -- на сколько дней даётся роль, 0 — навсегда
+        PRIMARY KEY (guild_id, role_id)
+    )
+""")
+db.execute("""
+    CREATE TABLE IF NOT EXISTS shop_purchases (
+        guild_id INTEGER,
+        user_id  INTEGER,
+        role_id  INTEGER,
+        expires  REAL,      -- когда снять роль (время в секундах)
+        PRIMARY KEY (guild_id, user_id, role_id)
+    )
+""")
+db.commit()
+
+
+def shop_items(guild):
+    """Роли в магазине сервера: список (роль, цена, дней), от дешёвых к дорогим. Удалённые роли пропускаем."""
+    rows = db.execute("SELECT role_id, price, days FROM shop_roles WHERE guild_id = ? ORDER BY price", (guild.id,))
+    return [(guild.get_role(role_id), price, days) for role_id, price, days in rows if guild.get_role(role_id)]
+
+
+def days_text(days):
+    return "навсегда" if days == 0 else f"на {days} {plural(days, 'день', 'дня', 'дней')}"
+
+
+async def shop_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=f"{role.name} — {money_text(price)}, {days_text(days)}"[:100], value=str(role.id))
+            for role, price, days in shop_items(interaction.guild) if current.lower() in role.name.lower()][:25]
+
+
+@bot.tree.command(name="shop", description="Магазин ролей: что можно купить за монеты")
+@app_commands.guild_only()
+async def shop(interaction: discord.Interaction):
+    items = shop_items(interaction.guild)
+    if not items:
+        await interaction.response.send_message(
+            "🛒 В магазине пока пусто. Админ может выставить роль командой /shop_add.", ephemeral=True)
+        return
+    lines = [f"{role.mention} — **{money_text(price)}**, {days_text(days)}" for role, price, days in items]
+    embed = discord.Embed(color=0x7C6CF2, title="🛒 Магазин ролей", description="\n".join(lines))
+    embed.set_footer(text="Купить — /shop_buy")
+    await interaction.response.send_message(embed=embed, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="shop_buy", description="Купить роль из магазина за монеты")
+@app_commands.describe(role="Какую роль купить")
+@app_commands.autocomplete(role=shop_autocomplete)
+@app_commands.guild_only()
+async def shop_buy(interaction: discord.Interaction, role: str):
+    item = next((item for item in shop_items(interaction.guild) if str(item[0].id) == role), None)
+    if item is None:
+        await interaction.response.send_message("Такой роли в магазине нет — выбери из списка.", ephemeral=True)
+        return
+    role_, price, days = item
+    row = db.execute("SELECT expires FROM shop_purchases WHERE guild_id = ? AND user_id = ? AND role_id = ?",
+                     (interaction.guild_id, interaction.user.id, role_.id)).fetchone()
+    if role_ in interaction.user.roles and (days == 0 or row is None):
+        await interaction.response.send_message("Эта роль у тебя уже есть.", ephemeral=True)
+        return
+    me = interaction.guild.me
+    if not me.guild_permissions.manage_roles or role_ >= me.top_role:
+        await interaction.response.send_message(
+            "Не могу выдать эту роль: мне нужно право «Управлять ролями», и моя роль должна быть выше неё. "
+            "Скажи админу.", ephemeral=True)
+        return
+    if not await take_bet(interaction, price, "цена роли"):
+        return
+    try:
+        await interaction.user.add_roles(role_, reason="Покупка в магазине ролей")
+    except discord.HTTPException:
+        add_money(interaction.guild_id, interaction.user, price)  # не получилось — возвращаем монеты
+        await interaction.response.send_message("Не получилось выдать роль — монеты вернул. Скажи админу.",
+                                                ephemeral=True)
+        return
+    text = f"🛒 {interaction.user.mention} покупает роль {role_.mention} за **{money_text(price)}**"
+    if days:
+        start = max(row[0], time.time()) if row else time.time()  # уже куплена — продлеваем
+        expires = start + days * 86400
+        db.execute("INSERT OR REPLACE INTO shop_purchases (guild_id, user_id, role_id, expires) VALUES (?, ?, ?, ?)",
+                   (interaction.guild_id, interaction.user.id, role_.id, expires))
+        db.commit()
+        text += f" — до <t:{int(expires)}:f>"
+    await interaction.response.send_message(text + ".", allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="shop_add", description="Выставить роль на продажу в магазине (или поменять цену)")
+@app_commands.describe(role="Какую роль продавать", price="Цена в монетах",
+                       days="На сколько дней даётся роль (0 — навсегда)")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def shop_add(interaction: discord.Interaction, role: discord.Role,
+                   price: app_commands.Range[int, 1, 100_000_000], days: app_commands.Range[int, 0, 365] = 0):
+    me = interaction.guild.me
+    if role.is_default() or role.managed:
+        await interaction.response.send_message("Эту роль продавать нельзя (она служебная).", ephemeral=True)
+        return
+    if role.permissions.administrator or role.permissions.manage_guild or role.permissions.moderate_members:
+        await interaction.response.send_message(
+            "У этой роли права админа или модератора — такие роли в магазин не ставлю.", ephemeral=True)
+        return
+    if not me.guild_permissions.manage_roles or role >= me.top_role:
+        await interaction.response.send_message(
+            "Я не смогу выдавать эту роль: мне нужно право «Управлять ролями», и моя роль должна быть выше неё.",
+            ephemeral=True)
+        return
+    db.execute("INSERT OR REPLACE INTO shop_roles (guild_id, role_id, price, days) VALUES (?, ?, ?, ?)",
+               (interaction.guild_id, role.id, price, days))
+    db.commit()
+    await interaction.response.send_message(
+        f"✅ {role.mention} в магазине: {money_text(price)}, {days_text(days)}.", ephemeral=True)
+
+
+@bot.tree.command(name="shop_remove", description="Убрать роль из магазина")
+@app_commands.describe(role="Какую роль убрать")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def shop_remove(interaction: discord.Interaction, role: discord.Role):
+    removed = db.execute("DELETE FROM shop_roles WHERE guild_id = ? AND role_id = ?",
+                         (interaction.guild_id, role.id)).rowcount
+    db.commit()
+    await interaction.response.send_message(
+        f"✅ {role.mention} убрана из магазина. У кого она уже куплена — остаётся." if removed
+        else "Этой роли и так нет в магазине.", ephemeral=True)
+
+
+async def shop_expire_roles():
+    """Снимает роли, срок которых вышел."""
+    now = time.time()
+    for guild_id, user_id, role_id in db.execute(
+            "SELECT guild_id, user_id, role_id FROM shop_purchases WHERE expires <= ?", (now,)).fetchall():
+        guild = bot.get_guild(guild_id)
+        role = guild.get_role(role_id) if guild else None
+        if role:
+            try:
+                member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+                await member.remove_roles(role, reason="Закончился срок роли из магазина")
+            except discord.NotFound:
+                pass  # человек ушёл с сервера
+            except discord.HTTPException as error:
+                print("Магазин ролей: не получилось снять роль:", error)
+                continue  # попробуем в следующий раз
+        db.execute("DELETE FROM shop_purchases WHERE guild_id = ? AND user_id = ? AND role_id = ?",
+                   (guild_id, user_id, role_id))
+        db.commit()
+
+
+# ============================================================
+#  БОИ И ОБМЕН ПИТОМЦАМИ (/pet_battle, /pet_trade)
+#  Бой: твой питомец против самого сильного питомца соперника, на ставку. Чем больше доход питомца в час,
+#  тем выше шанс победить (но у слабого всегда остаётся шанс). Обмен: питомец на питомца, оба согласны.
+# ============================================================
+PET_BATTLE_MIN_CHANCE = 10  # шанс победить в бою не бывает меньше 10% и больше 90%
+
+
+def battle_chance(power, enemy_power):
+    """Шанс победить в процентах: доля своей силы в общей, но не меньше 10% и не больше 90%."""
+    chance = round(100 * power / (power + enemy_power))
+    return min(max(chance, PET_BATTLE_MIN_CHANCE), 100 - PET_BATTLE_MIN_CHANCE)
+
+
+@bot.tree.command(name="pet_battle", description="Бой питомцев на ставку: твой питомец против сильнейшего у соперника")
+@app_commands.describe(member="Кого вызвать на бой", pet="Какой твой питомец дерётся", bet="Ставка в монетах")
+@app_commands.autocomplete(pet=pet_autocomplete)
+@app_commands.guild_only()
+async def pet_battle(interaction: discord.Interaction, member: discord.Member, pet: int,
+                     bet: app_commands.Range[int, 1, MAX_BET]):
+    challenger = interaction.user
+    mine = own_pet(interaction, pet)
+    if member.bot or member.id == challenger.id:
+        await interaction.response.send_message("Вызови на бой другого участника (не бота и не себя).", ephemeral=True)
+        return
+    if mine is None:
+        await interaction.response.send_message("Такого питомца у тебя нет — выбери из списка.", ephemeral=True)
+        return
+    if not user_pets(interaction.guild_id, member.id):
+        await interaction.response.send_message("У него пока нет питомцев — драться не с кем.", ephemeral=True)
+        return
+    if bet < MIN_BET or get_wallet(interaction.guild_id, challenger)[0] < bet:
+        await interaction.response.send_message(
+            f"Ставка — от {money_text(MIN_BET)}, и у тебя должно хватать монет.", ephemeral=True)
+        return
+    guild_id = interaction.guild_id
+
+    async def fight(accept: discord.Interaction):
+        my_pet = db.execute("SELECT species, level FROM pets WHERE id = ? AND user_id = ?",
+                            (mine[0], challenger.id)).fetchone()
+        enemy_pets = user_pets(guild_id, member.id)
+        if my_pet is None or not enemy_pets:  # пока ждали ответа, питомца продали или обменяли
+            await accept.response.edit_message(content="Бой отменён: у кого-то больше нет питомца.", view=None)
+            return
+        if get_wallet(guild_id, challenger)[0] < bet or get_wallet(guild_id, member)[0] < bet:
+            await accept.response.edit_message(content=f"Бой отменён: кому-то не хватает {money_text(bet)} на ставку.",
+                                               view=None)
+            return
+        _, enemy_species, enemy_level, _, _ = enemy_pets[0]  # самый сильный питомец соперника
+        chance = battle_chance(pet_income(*my_pet), pet_income(enemy_species, enemy_level))
+        winner, loser = (challenger, member) if random.uniform(0, 100) < chance else (member, challenger)
+        add_money(guild_id, loser, -bet)
+        balance = add_money(guild_id, winner, bet)
+        await accept.response.edit_message(
+            content=f"⚔️ {pet_title(*my_pet)} ({challenger.mention}, шанс {chance}%) против "
+                    f"{pet_title(enemy_species, enemy_level)} ({member.mention}, шанс {100 - chance}%)\n"
+                    f"🏆 Побеждает {winner.mention} и забирает **{money_text(bet)}**! Баланс: **{money_text(balance)}**.",
+            view=None, allowed_mentions=NO_PINGS)
+
+    await send_challenge(
+        interaction, member,
+        f"⚔️ {member.mention}, {challenger.mention} вызывает твоего сильнейшего питомца на бой с "
+        f"{pet_title(mine[1], mine[2])}! Ставка — **{money_text(bet)}** с каждого.", fight)
+
+
+async def other_pet_autocomplete(interaction: discord.Interaction, current: str):
+    """Подсказки в поле «питомец соперника»: питомцы того, кого выбрали в поле member."""
+    member = getattr(interaction.namespace, "member", None)
+    member_id = getattr(member, "id", None)
+    if member_id is None:
+        return []
+    choices = []
+    for number_, (pet_id, species, level, _, _) in enumerate(user_pets(interaction.guild_id, member_id), 1):
+        label = f"{number_}. {pet_title(species, level)}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=pet_id))
+    return choices[:25]
+
+
+@bot.tree.command(name="pet_trade", description="Предложить обмен питомцами: твой питомец на питомца другого участника")
+@app_commands.describe(member="С кем меняться", pet="Какого своего питомца отдаёшь", their_pet="Какого питомца хочешь взамен")
+@app_commands.autocomplete(pet=pet_autocomplete, their_pet=other_pet_autocomplete)
+@app_commands.guild_only()
+async def pet_trade(interaction: discord.Interaction, member: discord.Member, pet: int, their_pet: int):
+    trader, guild_id = interaction.user, interaction.guild_id
+    mine = own_pet(interaction, pet)
+    theirs = db.execute("SELECT id, species, level FROM pets WHERE id = ? AND guild_id = ? AND user_id = ?",
+                        (their_pet, guild_id, member.id)).fetchone()
+    if member.bot or member.id == trader.id:
+        await interaction.response.send_message("Меняться можно с другим участником (не с ботом и не с собой).",
+                                                ephemeral=True)
+        return
+    if mine is None or theirs is None or theirs[1] not in PET_SPECIES:
+        await interaction.response.send_message("Выбери своего питомца и питомца соперника из списков.", ephemeral=True)
+        return
+
+    async def swap(accept: discord.Interaction):
+        # Пока ждали ответа, питомцев могли продать — проверяем, что оба на месте, и меняем хозяев местами
+        still_mine = db.execute("SELECT 1 FROM pets WHERE id = ? AND user_id = ?", (mine[0], trader.id)).fetchone()
+        still_theirs = db.execute("SELECT 1 FROM pets WHERE id = ? AND user_id = ?", (theirs[0], member.id)).fetchone()
+        if not (still_mine and still_theirs):
+            await accept.response.edit_message(content="Обмен отменён: у кого-то больше нет этого питомца.", view=None)
+            return
+        db.execute("UPDATE pets SET user_id = ? WHERE id = ?", (member.id, mine[0]))
+        db.execute("UPDATE pets SET user_id = ? WHERE id = ?", (trader.id, theirs[0]))
+        db.commit()
+        await accept.response.edit_message(
+            content=f"🤝 Обмен состоялся: {trader.mention} получает {pet_title(theirs[1], theirs[2])}, "
+                    f"{member.mention} получает {pet_title(mine[1], mine[2])}.",
+            view=None, allowed_mentions=NO_PINGS)
+
+    await send_challenge(
+        interaction, member,
+        f"🤝 {member.mention}, {trader.mention} предлагает обмен: его {pet_title(mine[1], mine[2])} "
+        f"на твоего {pet_title(theirs[1], theirs[2])}. Накопленные монеты уходят вместе с питомцем.", swap)
+
+
+# ============================================================
+#  МУЗЫКА: КНОПКИ ПОД «ИГРАЕТ», АВТОПЛЕЙ, ПЛЕЙЛИСТЫ СЕРВЕРА, ТЕКСТ ПЕСНИ
+# ============================================================
+db.execute("""
+    CREATE TABLE IF NOT EXISTS music_settings (
+        guild_id INTEGER PRIMARY KEY,
+        autoplay INTEGER    -- 1 — когда очередь кончилась, бот сам включает похожие треки
+    )
+""")
+db.execute("""
+    CREATE TABLE IF NOT EXISTS playlists (
+        guild_id INTEGER,
+        name     TEXT,      -- название плейлиста (как его назвали при сохранении)
+        position INTEGER,   -- номер трека в плейлисте
+        url      TEXT,
+        title    TEXT,
+        PRIMARY KEY (guild_id, name, position)
+    )
+""")
+db.commit()
+
+MAX_PLAYLISTS = 25         # сколько плейлистов может сохранить один сервер
+MAX_PLAYLIST_SAVE = 100    # сколько треков помещается в один плейлист
+
+
+def same_voice(interaction):
+    """Голосовое подключение бота, если нажавший сидит в том же голосовом канале. Иначе None."""
+    vc = interaction.guild.voice_client
+    voice = getattr(interaction.user, "voice", None)
+    return vc if vc and voice and voice.channel == vc.channel else None
+
+
+def queue_shuffle(guild_id):
+    """Перемешивает очередь сервера. Возвращает, сколько в ней треков."""
+    rows = db.execute("SELECT id, url, title FROM queue WHERE guild_id = ? ORDER BY id", (guild_id,)).fetchall()
+    tracks = [(url, title) for _, url, title in rows]
+    random.shuffle(tracks)
+    for (row_id, _, _), (url, title) in zip(rows, tracks):  # номера остаются, меняются местами сами треки
+        db.execute("UPDATE queue SET url = ?, title = ? WHERE id = ?", (url, title, row_id))
+    db.commit()
+    return len(rows)
+
+
+class MusicControls(discord.ui.View):
+    """Кнопки под сообщением «Играет»: пауза, следующий трек, повтор, перемешать очередь.
+    Нажимать может тот, кто сидит с ботом в одном голосовом канале. Работают и после перезапуска бота."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def voice(self, interaction):
+        vc = same_voice(interaction)
+        if vc is None:
+            await interaction.response.send_message("Зайди в голосовой канал, где играет бот.", ephemeral=True)
+        return vc
+
+    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary, custom_id="music:pause")
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await self.voice(interaction)
+        if vc is None:
+            return
+        if vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message(f"▶️ {interaction.user.mention} продолжает музыку.",
+                                                    allowed_mentions=NO_PINGS)
+        elif vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message(f"⏸️ {interaction.user.mention} ставит на паузу.",
+                                                    allowed_mentions=NO_PINGS)
+        else:
+            await interaction.response.send_message("Сейчас ничего не играет.", ephemeral=True)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="music:skip")
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await self.voice(interaction)
+        if vc is None:
+            return
+        if vc.is_playing() or vc.is_paused():
+            skipped_tracks.add(interaction.guild.id)
+            vc.stop()
+            await interaction.response.send_message(f"⏭️ {interaction.user.mention} пропускает трек.",
+                                                    allowed_mentions=NO_PINGS)
+        else:
+            await interaction.response.send_message("Сейчас ничего не играет.", ephemeral=True)
+
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:repeat")
+    async def repeat_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self.voice(interaction) is None:
+            return
+        guild_id = interaction.guild.id
+        if guild_id in repeat_on:
+            repeat_on.discard(guild_id)
+            text = f"➡️ {interaction.user.mention} выключает повтор."
+        else:
+            repeat_on.add(guild_id)
+            text = f"🔁 {interaction.user.mention} включает повтор: трек будет играть снова, пока не нажмут ⏭️ или 🔁."
+        await interaction.response.send_message(text, allowed_mentions=NO_PINGS)
+
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="music:shuffle")
+    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self.voice(interaction) is None:
+            return
+        count = queue_shuffle(interaction.guild.id)
+        if count < 2:
+            await interaction.response.send_message("В очереди нечего перемешивать.", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                f"🔀 {interaction.user.mention} перемешивает очередь ({count} {plural(count, 'трек', 'трека', 'треков')}).",
+                allowed_mentions=NO_PINGS)
+
+
+# ---------- Автоплей ----------
+autoplay_recent = {}  # id сервера → ссылки, которые недавно играли (чтобы автоплей не ходил по кругу)
+YOUTUBE_ID = re.compile(r"(?:v=|youtu\.be/|/shorts/)([\w-]{11})")
+
+
+def autoplay_enabled(guild_id):
+    row = db.execute("SELECT autoplay FROM music_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+    return bool(row and row[0])
+
+
+async def similar_tracks(url):
+    """Похожие треки с YouTube: берём «микс» (автоматический плейлист YouTube) для этого видео.
+    Возвращает список (ссылка, название) без самого видео. Не YouTube или не получилось — пустой список."""
+    match = YOUTUBE_ID.search(url or "")
+    if not match:
+        return []
+    video_id = match[1]
+
+    def extract():
+        options = {"quiet": True, "extract_flat": True, "playlistend": 15, "noplaylist": False}
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}", download=False)
+        return [(f"https://www.youtube.com/watch?v={entry['id']}", entry.get("title") or "Без названия")
+                for entry in info.get("entries") or [] if entry and entry.get("id") and entry["id"] != video_id]
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, extract)
+    except Exception as error:
+        print("Автоплей: не получилось найти похожие треки:", error)
+        return []
+
+
+async def autoplay_add(guild, text_channel, url):
+    """Очередь кончилась: если автоплей включён и бота кто-то слушает — добавляет в очередь похожий трек."""
+    vc = guild.voice_client
+    if not (autoplay_enabled(guild.id) and vc and vc.is_connected()):
+        return
+    if not any(not member.bot for member in vc.channel.members):
+        return  # в канале никого нет — не играем в пустоту
+    recent = autoplay_recent.setdefault(guild.id, [])
+    recent.append(url)
+    del recent[:-40]  # помним последние 40 треков
+    fresh = [track for track in await similar_tracks(url) if track[0] not in recent]
+    if not fresh:
+        return
+    track_url, title = random.choice(fresh[:6])  # один из самых близких, но не всегда один и тот же
+    queue_add(guild.id, track_url, title)
+    await text_channel.send(f"📻 Автоплей: дальше **{title}**. Выключить — /autoplay.")
+
+
+@bot.tree.command(name="autoplay", description="Автоплей: когда очередь кончилась, бот сам включает похожие треки")
+@app_commands.guild_only()
+async def autoplay(interaction: discord.Interaction):
+    enabled = not autoplay_enabled(interaction.guild_id)
+    db.execute("INSERT OR REPLACE INTO music_settings (guild_id, autoplay) VALUES (?, ?)",
+               (interaction.guild_id, int(enabled)))
+    db.commit()
+    await interaction.response.send_message(
+        "📻 Автоплей включён: когда очередь закончится, я сам подберу похожий трек (работает для треков с YouTube)."
+        if enabled else "📻 Автоплей выключен.")
+
+
+# ---------- Плейлисты сервера ----------
+def playlist_names(guild_id):
+    return [row[0] for row in db.execute(
+        "SELECT name FROM playlists WHERE guild_id = ? GROUP BY name ORDER BY name", (guild_id,))]
+
+
+async def playlist_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=name[:100], value=name)
+            for name in playlist_names(interaction.guild_id) if current.lower() in name.lower()][:25]
+
+
+@bot.tree.command(name="playlist_save", description="Сохранить текущий трек и очередь как плейлист сервера")
+@app_commands.describe(name="Как назвать плейлист")
+@app_commands.guild_only()
+async def playlist_save(interaction: discord.Interaction, name: app_commands.Range[str, 1, 40]):
+    guild_id, name = interaction.guild_id, name.strip()
+    tracks = ([now_playing[guild_id]] if guild_id in now_playing else []) + [
+        (url, title) for url, title in db.execute(
+            "SELECT url, title FROM queue WHERE guild_id = ? ORDER BY id", (guild_id,))]
+    tracks = tracks[:MAX_PLAYLIST_SAVE]
+    if not name or not tracks:
+        await interaction.response.send_message("Сохранять нечего: сейчас ничего не играет и очередь пуста.",
+                                                ephemeral=True)
+        return
+    names = playlist_names(guild_id)
+    if name not in names and len(names) >= MAX_PLAYLISTS:
+        await interaction.response.send_message(
+            f"На сервере уже {MAX_PLAYLISTS} плейлистов — удали ненужный: /playlist_delete.", ephemeral=True)
+        return
+    db.execute("DELETE FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, name))  # то же имя — перезаписываем
+    db.executemany("INSERT INTO playlists (guild_id, name, position, url, title) VALUES (?, ?, ?, ?, ?)",
+                   [(guild_id, name, position, url, title) for position, (url, title) in enumerate(tracks)])
+    db.commit()
+    await interaction.response.send_message(
+        f"💾 Плейлист **{name}** сохранён: {len(tracks)} {plural(len(tracks), 'трек', 'трека', 'треков')}. "
+        f"Включить — /playlist_play.")
+
+
+@bot.tree.command(name="playlist_play", description="Добавить в очередь сохранённый плейлист сервера")
+@app_commands.describe(name="Какой плейлист включить")
+@app_commands.autocomplete(name=playlist_autocomplete)
+@app_commands.guild_only()
+async def playlist_play(interaction: discord.Interaction, name: str):
+    tracks = db.execute("SELECT url, title FROM playlists WHERE guild_id = ? AND name = ? ORDER BY position",
+                        (interaction.guild_id, name)).fetchall()
+    if not tracks:
+        await interaction.response.send_message("Такого плейлиста нет — выбери из списка (/playlists).", ephemeral=True)
+        return
+    if interaction.user.voice is None:
+        await interaction.response.send_message("Сначала зайди в голосовой канал.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    if interaction.guild.voice_client is None:
+        await interaction.user.voice.channel.connect()
+    for url, title in tracks:
+        queue_add(interaction.guild_id, url, title)
+    await interaction.followup.send(
+        f"📜 Плейлист **{name}**: добавил в очередь {len(tracks)} {plural(len(tracks), 'трек', 'трека', 'треков')}.")
+    await play_next(interaction.guild, interaction.channel)
+
+
+@bot.tree.command(name="playlists", description="Сохранённые плейлисты сервера")
+@app_commands.guild_only()
+async def show_playlists(interaction: discord.Interaction):
+    rows = db.execute("SELECT name, COUNT(*) FROM playlists WHERE guild_id = ? GROUP BY name ORDER BY name",
+                      (interaction.guild_id,)).fetchall()
+    if not rows:
+        await interaction.response.send_message(
+            "Плейлистов пока нет. Собери очередь и сохрани её: /playlist_save.", ephemeral=True)
+        return
+    lines = [f"• **{name}** — {count} {plural(count, 'трек', 'трека', 'треков')}" for name, count in rows]
+    await interaction.response.send_message("💾 Плейлисты сервера:\n" + "\n".join(lines))
+
+
+@bot.tree.command(name="playlist_delete", description="Удалить сохранённый плейлист сервера")
+@app_commands.describe(name="Какой плейлист удалить")
+@app_commands.autocomplete(name=playlist_autocomplete)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def playlist_delete(interaction: discord.Interaction, name: str):
+    removed = db.execute("DELETE FROM playlists WHERE guild_id = ? AND name = ?", (interaction.guild_id, name)).rowcount
+    db.commit()
+    await interaction.response.send_message(
+        f"🗑️ Плейлист **{name}** удалён." if removed else "Такого плейлиста нет.", ephemeral=True)
+
+
+# ---------- Текст песни ----------
+# Сами тексты бот в чат не пишет (они защищены авторским правом) — он даёт кнопку на страницу с текстом.
+LYRICS_NOISE = re.compile(r"[\(\[][^\)\]]*(official|video|audio|lyric|клип|премьера|hd|4k|remaster|visualizer)"
+                          r"[^\)\]]*[\)\]]", re.IGNORECASE)
+
+
+def lyrics_query(title):
+    """Название трека без мусора вроде «(Official Video)» — чтобы поиск текста нашёл песню."""
+    return re.sub(r"\s+", " ", LYRICS_NOISE.sub(" ", title)).strip(" -|")
+
+
+@bot.tree.command(name="lyrics", description="Найти текст песни (той, что играет, или по названию)")
+@app_commands.describe(song="Название песни (если не указать — та, что сейчас играет)")
+@app_commands.guild_only()
+async def lyrics(interaction: discord.Interaction, song: app_commands.Range[str, 1, 150] | None = None):
+    title = song or (now_playing.get(interaction.guild_id) or (None, None))[1]
+    if not title:
+        await interaction.response.send_message("Сейчас ничего не играет — напиши название песни в поле song.",
+                                                ephemeral=True)
+        return
+    query = lyrics_query(title) or title
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Открыть текст на Genius",
+                                    url="https://genius.com/search?q=" + urllib.parse.quote(query, safe="")))
+    await interaction.response.send_message(f"🎤 Текст песни **{query}**:", view=view, ephemeral=True)
+
+
+# ============================================================
+#  ПРИВЕТСТВИЕ НОВИЧКОВ (/welcome_channel)
+#  Когда на сервер заходит новый участник, бот пишет в выбранный канал приветствие (его сочиняет ИИ, а без ИИ —
+#  обычный текст) и прикладывает картинку-карточку. Нужно разрешение Server Members Intent — см. README.
+# ============================================================
+db.execute("""
+    CREATE TABLE IF NOT EXISTS welcome_channel (
+        guild_id   INTEGER PRIMARY KEY,
+        channel_id INTEGER
+    )
+""")
+db.commit()
+
+WELCOME_TASK = """На Discord-сервер «{server}» только что зашёл новый участник по имени {name}.
+Поприветствуй его от себя ОДНОЙ короткой фразой в своём характере. Не используй упоминания, не задавай вопросов
+о личном и не пиши ничего, кроме самого приветствия."""
+
+
+def make_welcome_card(name, avatar_bytes, server_name, member_number):
+    """Картинка-приветствие 1000×300 в том же стиле, что и карточка /rank."""
+    width, height = 1000, 300
+    card, _ = make_background((width, height), 36)
+    ring = gradient((216, 216), ACCENT_1, ACCENT_2)
+    card = paste_rounded(card, ring, (42, 42), 108)
+    card = paste_rounded(card, Image.new("RGBA", (204, 204), BG_LEFT + (255,)), (48, 48), 102)
+    card.alpha_composite(make_avatar(avatar_bytes, 192, name), (54, 54))
+    draw = ImageDraw.Draw(card)
+    draw.text((300, 100), "ДОБРО ПОЖАЛОВАТЬ", font=load_font(30, True), fill=TEXT_DIM, anchor="ls")
+    name_font = load_font(64, True)
+    draw.text((298, 178), fit_text(draw, name, name_font, 650), font=name_font, fill=WHITE, anchor="ls")
+    info_font = load_font(28)
+    draw.text((300, 232), fit_text(draw, f"{server_name} · участник №{member_number}", info_font, 650),
+              font=info_font, fill=TEXT_DIM, anchor="ls")
+    return to_png(card)
+
+
+async def welcome_text(member):
+    """Приветствие от ИИ; если ИИ нет или он не ответил — обычная фраза."""
+    if ai_client:
+        try:
+            response = await ai_generate(WELCOME_TASK.format(server=member.guild.name, name=member.display_name),
+                                         ai_system_prompt())
+            text = MOD_TAG.sub("", REMEMBER_TAG.sub("", (response.text or ""))).strip()
+            if text and not IGNORE_TAG.search(text):
+                return to_one_line(text)[:500]
+        except Exception as error:
+            print("Приветствие: ИИ не ответил:", error)
+    return "Добро пожаловать! Располагайся."
+
+
+@bot.event
+async def on_member_join(member):
+    """Новый участник на сервере (событие приходит, только если включён members_intent)."""
+    row = db.execute("SELECT channel_id FROM welcome_channel WHERE guild_id = ?", (member.guild.id,)).fetchone()
+    channel = member.guild.get_channel(row[0]) if row else None
+    if channel is None or member.bot:
+        return
+    try:
+        text = await welcome_text(member)
+        image = await asyncio.to_thread(make_welcome_card, member.display_name, await get_avatar(member),
+                                        member.guild.name, member.guild.member_count or 0)
+        await channel.send(f"👋 {member.mention} {text}", file=discord.File(image, filename="welcome.png"),
+                           allowed_mentions=discord.AllowedMentions(users=[member]))
+    except discord.HTTPException as error:
+        await report_error("Приветствие новичка", error, member.guild, member, channel)
+
+
+@bot.tree.command(name="welcome_channel", description="Канал, где бот приветствует новых участников (пусто — выключить)")
+@app_commands.describe(channel="Канал для приветствий. Пусто — выключить")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def set_welcome_channel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+    if channel is None:
+        db.execute("DELETE FROM welcome_channel WHERE guild_id = ?", (interaction.guild_id,))
+        db.commit()
+        await interaction.response.send_message("✅ Больше не приветствую новичков.", ephemeral=True)
+        return
+    permissions = channel.permissions_for(interaction.guild.me)
+    if not (permissions.view_channel and permissions.send_messages and permissions.attach_files):
+        await interaction.response.send_message(
+            f"Мне не хватает прав в {channel.mention}: нужны «Просматривать канал», «Отправлять сообщения» "
+            f"и «Прикреплять файлы».", ephemeral=True)
+        return
+    db.execute("INSERT OR REPLACE INTO welcome_channel (guild_id, channel_id) VALUES (?, ?)",
+               (interaction.guild_id, channel.id))
+    db.commit()
+    text = f"✅ Буду приветствовать новичков в {channel.mention}."
+    if not MEMBERS_INTENT:
+        text += ("\n⚠️ Пока это не заработает: боту нужно разрешение. Developer Portal → Bot → включить "
+                 "**Server Members Intent**, потом в `settings.ini` в разделе `[welcome]` поставить "
+                 "`members_intent = on` и перезапустить бота.")
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+# ============================================================
+#  АНТИ-СПАМ
+#  Одно и то же сообщение много раз подряд или пачка сообщений со ссылками — бот удаляет их и выдаёт варн
+#  (а варны сами приводят к тайм-ауту, см. warn_punishments). Модераторов не трогает.
+#  Настройки — settings.ini, раздел [antispam].
+# ============================================================
+ANTISPAM = setting("antispam", "enabled", "on").lower() not in ("off", "нет", "no", "0")
+SPAM_REPEATS = max(2, setting("antispam", "same_messages", 4))    # столько одинаковых сообщений подряд — спам
+SPAM_LINKS = max(2, setting("antispam", "link_messages", 4))      # столько сообщений со ссылками подряд — спам
+SPAM_WINDOW = max(5, setting("antispam", "window_seconds", 20))   # за сколько секунд их считать
+HAS_LINK = re.compile(r"https?://|discord\.gg/", re.IGNORECASE)
+spam_recent = {}  # (сервер, участник) → последние сообщения: список (время, текст, есть ли ссылка, сообщение)
+spam_punished = {}  # (сервер, участник) → когда последний раз наказали (чтобы не выдать два варна за один спам)
+
+
+async def check_spam(message):
+    """Проверяет сообщение на спам. True — это спам: сообщения удалены, участнику выдан варн."""
+    member = message.author
+    if not ANTISPAM or not isinstance(member, discord.Member) or is_moderator(member):
+        return False
+    now, key = time.time(), (message.guild.id, member.id)
+    text = " ".join(message.content.lower().split())
+    recent = [entry for entry in spam_recent.get(key, []) if now - entry[0] <= SPAM_WINDOW]
+    recent.append((now, text, bool(HAS_LINK.search(text)), message))
+    spam_recent[key] = recent[-12:]
+    same = [entry for entry in recent if text and entry[1] == text]
+    links = [entry for entry in recent if entry[2]]
+    if len(same) >= SPAM_REPEATS:
+        spam, reason = same, "спам одинаковыми сообщениями"
+    elif len(links) >= SPAM_LINKS:
+        spam, reason = links, "спам ссылками"
+    else:
+        return False
+    spam_recent[key] = []
+    for entry in spam:  # убираем спам из чата (если у бота есть право «Управлять сообщениями»)
+        try:
+            await entry[3].delete()
+        except discord.HTTPException:
+            pass
+    if now - spam_punished.get(key, 0) < 60:  # за этот спам уже наказали — просто молча чистим
+        return True
+    spam_punished[key] = now
+    count = add_warn(message.guild.id, member.id, bot.user.id, reason)
+    result = f"🚫 {member.mention} получает варн №{count}: {reason}."
+    minutes = min(warn_timeout_minutes(count), 28 * 24 * 60)
+    if minutes:
+        try:
+            await member.timeout(datetime.timedelta(minutes=minutes), reason=f"Варн №{count}: {reason}")
+            result += f" И тайм-аут на {minutes_text(minutes)}."
+        except discord.HTTPException:
+            pass  # не хватает прав — останется только варн
+    try:
+        await message.channel.send(result, allowed_mentions=NO_PINGS)
+        log_channel = log_channel_for(message.guild.id)
+        if log_channel:
+            await log_channel.send(f"{result} Канал: {message.channel.mention}", allowed_mentions=NO_PINGS)
+    except discord.HTTPException:
+        pass
+    return True
+
+
+# ============================================================
+#  НАПОМИНАНИЯ (/remind, /reminders)
+# ============================================================
+db.execute("""
+    CREATE TABLE IF NOT EXISTS reminders (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id   INTEGER,
+        channel_id INTEGER,
+        user_id    INTEGER,
+        due        REAL,      -- когда напомнить (время в секундах)
+        text       TEXT
+    )
+""")
+db.commit()
+
+MAX_REMINDERS = 10  # сколько напоминаний может ждать у одного человека
+DURATION_PART = re.compile(r"(\d+)\s*([a-zа-я]*)")
+DURATION_UNITS = {"с": 1, "s": 1, "м": 60, "m": 60, "ч": 3600, "h": 3600, "д": 86400, "d": 86400}
+
+
+def parse_duration(text):
+    """«2ч 30м», «45m», «1d», «90» (минуты) → секунды. Не получилось разобрать — None."""
+    text = text.lower().strip()
+    total, position = 0, 0
+    for match in DURATION_PART.finditer(text):
+        if text[position:match.start()].strip():
+            return None  # между числами что-то непонятное
+        unit = DURATION_UNITS.get(match[2][:1] if match[2] else "м")
+        if unit is None:
+            return None
+        total += int(match[1]) * unit
+        position = match.end()
+    return total if total and not text[position:].strip() else None
+
+
+@bot.tree.command(name="remind", description="Напомнить о чём-нибудь через указанное время")
+@app_commands.describe(when="Через сколько: 30м, 2ч, 1д, 1ч 30м (просто число — минуты)", text="О чём напомнить")
+@app_commands.guild_only()
+async def remind(interaction: discord.Interaction, when: app_commands.Range[str, 1, 30],
+                 text: app_commands.Range[str, 1, 500]):
+    seconds = parse_duration(when)
+    if seconds is None or not 30 <= seconds <= 365 * 86400:
+        await interaction.response.send_message(
+            "Не понял время. Примеры: `30м`, `2ч`, `1д`, `1ч 30м` (от 30 секунд до года).", ephemeral=True)
+        return
+    waiting = db.execute("SELECT COUNT(*) FROM reminders WHERE guild_id = ? AND user_id = ?",
+                         (interaction.guild_id, interaction.user.id)).fetchone()[0]
+    if waiting >= MAX_REMINDERS:
+        await interaction.response.send_message(
+            f"У тебя уже {MAX_REMINDERS} напоминаний — отмени лишние: /reminders.", ephemeral=True)
+        return
+    due = time.time() + seconds
+    db.execute("INSERT INTO reminders (guild_id, channel_id, user_id, due, text) VALUES (?, ?, ?, ?, ?)",
+               (interaction.guild_id, interaction.channel_id, interaction.user.id, due, text))
+    db.commit()
+    await interaction.response.send_message(f"⏰ Напомню <t:{int(due)}:R> (<t:{int(due)}:f>): {text}", ephemeral=True)
+
+
+@bot.tree.command(name="reminders", description="Твои напоминания (можно отменить одно по номеру)")
+@app_commands.describe(cancel="Номер напоминания, которое нужно отменить")
+@app_commands.guild_only()
+async def reminders(interaction: discord.Interaction, cancel: app_commands.Range[int, 1, MAX_REMINDERS] | None = None):
+    rows = db.execute("SELECT id, due, text FROM reminders WHERE guild_id = ? AND user_id = ? ORDER BY due",
+                      (interaction.guild_id, interaction.user.id)).fetchall()
+    if not rows:
+        await interaction.response.send_message("Напоминаний нет. Поставить — /remind.", ephemeral=True)
+        return
+    if cancel is not None:
+        if cancel > len(rows):
+            await interaction.response.send_message("Напоминания с таким номером нет.", ephemeral=True)
+            return
+        db.execute("DELETE FROM reminders WHERE id = ?", (rows[cancel - 1][0],))
+        db.commit()
+        await interaction.response.send_message(f"🗑️ Отменил напоминание: {rows[cancel - 1][2]}", ephemeral=True)
+        return
+    lines = [f"`{number_}.` <t:{int(due)}:R> — {text}" for number_, (_, due, text) in enumerate(rows, 1)]
+    await interaction.response.send_message("⏰ Твои напоминания:\n" + "\n".join(lines), ephemeral=True)
+
+
+async def send_due_reminders():
+    for reminder_id, channel_id, user_id, text in db.execute(
+            "SELECT id, channel_id, user_id, text FROM reminders WHERE due <= ?", (time.time(),)).fetchall():
+        db.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        db.commit()
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            await channel.send(f"⏰ <@{user_id}>, напоминаю: {text}",
+                               allowed_mentions=discord.AllowedMentions(users=[discord.Object(user_id)]))
+        except discord.HTTPException as error:
+            print("Напоминание не отправилось:", error)
+
+
+# ============================================================
+#  ОПРОСЫ (/poll)
+#  Вопрос и до 5 вариантов. Голосуют кнопками, голос можно поменять. Когда время выйдет, бот подводит итог.
+# ============================================================
+db.execute("""
+    CREATE TABLE IF NOT EXISTS polls (
+        message_id INTEGER PRIMARY KEY,
+        channel_id INTEGER,
+        author_id  INTEGER,
+        question   TEXT,
+        options    TEXT,      -- варианты ответа (JSON-список)
+        ends       REAL       -- когда закрыть опрос
+    )
+""")
+db.execute("""
+    CREATE TABLE IF NOT EXISTS poll_votes (
+        message_id INTEGER,
+        user_id    INTEGER,
+        option     INTEGER,   -- номер варианта, с нуля
+        PRIMARY KEY (message_id, user_id)
+    )
+""")
+db.commit()
+
+POLL_MAX_OPTIONS = 5
+
+
+def poll_embed(question, options, votes, ends, author_id, closed=False):
+    """Карточка опроса: вопрос, варианты с полосками и сколько осталось. votes — список чисел по вариантам."""
+    total = sum(votes)
+    best = max(votes) if total else 0
+    lines = []
+    for option, count in zip(options, votes):
+        share = count / total if total else 0
+        mark = " 🏆" if closed and count == best and count else ""
+        lines.append(f"**{option}**{mark}\n`{'█' * round(share * 12):<12}` {round(share * 100)}% · {count}")
+    embed = discord.Embed(color=0x7C6CF2, title=("📊 " if not closed else "📊 Итоги: ") + question,
+                          description="\n".join(lines))
+    voters = f"Проголосовало: {total}"
+    embed.add_field(name="​", value=f"{voters} · опрос от <@{author_id}> · " +
+                    ("завершён" if closed else f"закроется <t:{int(ends)}:R>"))
+    return embed
+
+
+def poll_votes_count(message_id, options):
+    counts = dict(db.execute("SELECT option, COUNT(*) FROM poll_votes WHERE message_id = ? GROUP BY option",
+                             (message_id,)).fetchall())
+    return [counts.get(index, 0) for index in range(len(options))]
+
+
+class PollView(discord.ui.View):
+    """Кнопки вариантов. labels — подписи для нового опроса; без них — заготовка, которая ловит нажатия
+    на кнопки старых опросов после перезапуска бота."""
+
+    def __init__(self, labels=None):
+        super().__init__(timeout=None)
+        for index in range(len(labels) if labels else POLL_MAX_OPTIONS):
+            button = discord.ui.Button(label=(labels[index] if labels else str(index + 1))[:80],
+                                       style=discord.ButtonStyle.secondary, custom_id=f"poll:{index}")
+            button.callback = self.voter(index)
+            self.add_item(button)
+
+    @staticmethod
+    def voter(index):
+        async def vote(interaction: discord.Interaction):
+            row = db.execute("SELECT question, options, ends, author_id FROM polls WHERE message_id = ?",
+                             (interaction.message.id,)).fetchone()
+            if row is None or row[2] <= time.time():
+                await interaction.response.send_message("Этот опрос уже закончился.", ephemeral=True)
+                return
+            question, options, ends, author_id = row[0], _json.loads(row[1]), row[2], row[3]
+            db.execute("INSERT OR REPLACE INTO poll_votes (message_id, user_id, option) VALUES (?, ?, ?)",
+                       (interaction.message.id, interaction.user.id, index))
+            db.commit()
+            await interaction.response.edit_message(
+                embed=poll_embed(question, options, poll_votes_count(interaction.message.id, options), ends, author_id))
+        return vote
+
+
+@bot.tree.command(name="poll", description="Опрос с кнопками: вопрос и до 5 вариантов ответа")
+@app_commands.describe(question="Вопрос", options="Варианты через | — например: Пицца | Суши | Бургеры",
+                       minutes="Сколько минут идёт опрос (по умолчанию 60)")
+@app_commands.guild_only()
+async def poll(interaction: discord.Interaction, question: app_commands.Range[str, 1, 200],
+               options: app_commands.Range[str, 3, 500], minutes: app_commands.Range[int, 1, 10080] = 60):
+    choices = [option.strip()[:80] for option in re.split(r"[|;\n]", options) if option.strip()]
+    if not 2 <= len(choices) <= POLL_MAX_OPTIONS or len(set(choices)) != len(choices):
+        await interaction.response.send_message(
+            f"Нужно от 2 до {POLL_MAX_OPTIONS} разных вариантов через `|`. Пример: `Пицца | Суши | Бургеры`",
+            ephemeral=True)
+        return
+    ends = time.time() + minutes * 60
+    await interaction.response.send_message(
+        embed=poll_embed(question, choices, [0] * len(choices), ends, interaction.user.id), view=PollView(choices),
+        allowed_mentions=NO_PINGS)
+    message = await interaction.original_response()
+    db.execute("INSERT INTO polls (message_id, channel_id, author_id, question, options, ends) VALUES (?, ?, ?, ?, ?, ?)",
+               (message.id, interaction.channel_id, interaction.user.id, question, _json.dumps(choices), ends))
+    db.commit()
+
+
+async def close_finished_polls():
+    for message_id, channel_id, author_id, question, options, ends in db.execute(
+            "SELECT message_id, channel_id, author_id, question, options, ends FROM polls WHERE ends <= ?",
+            (time.time(),)).fetchall():
+        options = _json.loads(options)
+        votes = poll_votes_count(message_id, options)
+        db.execute("DELETE FROM polls WHERE message_id = ?", (message_id,))
+        db.execute("DELETE FROM poll_votes WHERE message_id = ?", (message_id,))
+        db.commit()
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            message = channel.get_partial_message(message_id)
+            await message.edit(embed=poll_embed(question, options, votes, ends, author_id, closed=True), view=None)
+        except discord.HTTPException:
+            pass  # сообщение с опросом удалили
+
+
+# ============================================================
+#  ИИ: ПЕРЕСКАЗ ЧАТА (/summary) И ВИКТОРИНА (/quiz)
+# ============================================================
+SUMMARY_MAX_MESSAGES = 300
+SUMMARY_TASK = """Ниже сообщения из чата Discord за последние {hours} ч. Перескажи кратко, о чём говорили:
+3–7 пунктов списком, самое важное — первым. Называй участников по именам, без упоминаний через @.
+Не выдумывай того, чего в сообщениях нет. Если сообщений почти нет — так и скажи одной фразой.
+
+{chat}"""
+
+
+@bot.tree.command(name="summary", description="ИИ кратко перескажет, о чём говорили в этом канале")
+@app_commands.describe(hours="За сколько последних часов (по умолчанию 1)")
+@app_commands.guild_only()
+async def summary(interaction: discord.Interaction, hours: app_commands.Range[int, 1, 24] = 1):
+    if ai_client is None:
+        await interaction.response.send_message("ИИ не настроен: нет ключа Gemini.", ephemeral=True)
+        return
+    refusal = ai_limit_check(interaction.user.id)
+    if refusal:
+        await interaction.response.send_message(refusal, ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    after = discord.utils.utcnow() - datetime.timedelta(hours=hours)
+    lines = []
+    try:
+        async for old in interaction.channel.history(limit=SUMMARY_MAX_MESSAGES, after=after, oldest_first=False):
+            text = old.clean_content[:300]
+            if text and not old.author.bot:
+                lines.append(f"{old.author.display_name}: {text}")
+    except discord.HTTPException:
+        await interaction.followup.send("Не могу прочитать историю этого канала — не хватает прав.")
+        return
+    if len(lines) < 3:
+        await interaction.followup.send(f"За последние {hours} ч здесь почти ничего не писали.")
+        return
+    lines.reverse()  # history отдаёт от новых к старым
+    try:
+        response = await ai_generate(SUMMARY_TASK.format(hours=hours, chat="\n".join(lines)),
+                                     "Ты аккуратно и нейтрально пересказываешь переписку. Отвечай по-русски.")
+    except Exception as error:
+        await interaction.followup.send(ai_error_text(error))
+        return
+    text = MOD_TAG.sub("", (response.text or "")).strip() or "🤔 ИИ не дал ответа."
+    for part in split_message(f"📝 **О чём говорили за {hours} ч** ({len(lines)} сообщений):\n{text}"):
+        await interaction.followup.send(part, allowed_mentions=NO_PINGS)
+
+
+QUIZ_REWARD = max(0, setting("quiz", "reward", 100))   # монет за правильный ответ
+QUIZ_SECONDS = max(10, setting("quiz", "seconds", 30))  # сколько секунд на ответ
+QUIZ_TASK = """Придумай один вопрос для викторины{topic}. Вопрос должен быть интересным, с одним точно правильным
+ответом, не слишком простым и не слишком сложным. Ответь ТОЛЬКО в формате JSON, без пояснений:
+{{"question": "текст вопроса", "options": ["вариант 1", "вариант 2", "вариант 3", "вариант 4"], "answer": 0}}
+answer — номер правильного варианта, считая с нуля. Все варианты разные, каждый не длиннее 70 символов.
+Не повторяй эти вопросы: {used}"""
+quiz_recent = {}   # сервер → последние вопросы (чтобы ИИ не повторялся)
+quiz_running = set()  # каналы, где викторина идёт прямо сейчас
+
+
+def parse_quiz(text):
+    """Ответ ИИ → (вопрос, 4 варианта, номер правильного) или None, если ИИ ответил не по формату."""
+    match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    try:
+        data = _json.loads(match[0])
+        question, options, answer = str(data["question"]).strip(), [str(o).strip() for o in data["options"]], int(data["answer"])
+    except (TypeError, KeyError, ValueError):
+        return None
+    if not question or len(options) != 4 or len(set(options)) != 4 or not 0 <= answer < 4 or not all(options):
+        return None
+    return question[:300], [option[:80] for option in options], answer
+
+
+class QuizView(discord.ui.View):
+    """Четыре кнопки с вариантами. У каждого одна попытка; первый, кто ответил верно, получает монеты."""
+
+    def __init__(self, question, options, answer):
+        super().__init__(timeout=QUIZ_SECONDS)
+        self.question, self.options, self.answer = question, options, answer
+        self.tried, self.winner, self.message = set(), None, None
+        for index, option in enumerate(options):
+            button = discord.ui.Button(label=option, style=discord.ButtonStyle.secondary)
+            button.callback = self.chooser(index)
+            self.add_item(button)
+
+    def chooser(self, index):
+        async def choose(interaction: discord.Interaction):
+            if interaction.user.id in self.tried:
+                await interaction.response.send_message("У тебя была одна попытка 🙂", ephemeral=True)
+                return
+            self.tried.add(interaction.user.id)
+            if index != self.answer:
+                await interaction.response.send_message("❌ Неверно.", ephemeral=True)
+                return
+            self.winner = interaction.user
+            self.stop()
+            balance = add_money(interaction.guild_id, interaction.user, QUIZ_REWARD)
+            await interaction.response.edit_message(content=self.result(
+                f"🏆 Первым правильно ответил {interaction.user.mention}: **+{money_text(QUIZ_REWARD)}** "
+                f"(баланс {money_text(balance)})."), view=self.revealed(), allowed_mentions=NO_PINGS)
+        return choose
+
+    def revealed(self):
+        """Те же кнопки, но выключенные, а правильная — зелёная."""
+        for index, button in enumerate(self.children):
+            button.disabled = True
+            if index == self.answer:
+                button.style = discord.ButtonStyle.success
+        return self
+
+    def result(self, ending):
+        return f"🧠 **Викторина:** {self.question}\n✅ Правильный ответ: **{self.options[self.answer]}**\n{ending}"
+
+    async def on_timeout(self):
+        if self.message and self.winner is None:
+            try:
+                await self.message.edit(content=self.result("⌛ Время вышло — никто не угадал."), view=self.revealed())
+            except discord.HTTPException:
+                pass
+
+
+@bot.tree.command(name="quiz", description="Викторина от ИИ: кто первым ответит правильно — получит монеты")
+@app_commands.describe(topic="Тема вопроса (если не указать — любая)")
+@app_commands.guild_only()
+async def quiz(interaction: discord.Interaction, topic: app_commands.Range[str, 1, 60] | None = None):
+    if ai_client is None:
+        await interaction.response.send_message("ИИ не настроен: нет ключа Gemini.", ephemeral=True)
+        return
+    if interaction.channel_id in quiz_running:
+        await interaction.response.send_message("В этом канале уже идёт викторина — сначала ответьте на неё.",
+                                                ephemeral=True)
+        return
+    refusal = ai_limit_check(interaction.user.id)
+    if refusal:
+        await interaction.response.send_message(refusal, ephemeral=True)
+        return
+    quiz_running.add(interaction.channel_id)
+    try:
+        await interaction.response.defer()
+        used = quiz_recent.setdefault(interaction.guild_id, [])
+        task = QUIZ_TASK.format(topic=f" на тему «{topic}»" if topic else " на любую тему",
+                                used="; ".join(used[-15:]) or "пока нет")
+        try:
+            response = await ai_generate(task, "Ты ведущий викторины. Отвечай по-русски и строго в формате JSON.")
+        except Exception as error:
+            await interaction.followup.send(ai_error_text(error))
+            return
+        parsed = parse_quiz(response.text)
+        if parsed is None:
+            await interaction.followup.send("🤔 ИИ придумал вопрос не по правилам — попробуй ещё раз.")
+            return
+        question, options, answer = parsed
+        used.append(question)
+        del used[:-30]
+        view = QuizView(question, options, answer)
+        view.message = await interaction.followup.send(
+            f"🧠 **Викторина:** {question}\nНа ответ {QUIZ_SECONDS} сек., у каждого одна попытка. "
+            f"Приз — {money_text(QUIZ_REWARD)}.", view=view, wait=True)
+        await view.wait()
+    finally:
+        quiz_running.discard(interaction.channel_id)
+
+
+# ============================================================
+#  ФОНОВЫЕ ПРОВЕРКИ ДЛЯ НОВЫХ КОМАНД
+# ============================================================
+@tasks.loop(seconds=20)
+async def fast_loop():
+    """Раз в 20 секунд: напоминания, у которых пришло время, и опросы, которые пора закрыть."""
+    for job in (send_due_reminders, close_finished_polls):
+        try:
+            await job()
+        except Exception as error:
+            await report_error(f"Фоновая проверка {job.__name__}", error)
+
+
+@tasks.loop(minutes=10)
+async def slow_loop():
+    """Раз в 10 минут: снять роли из магазина, у которых вышел срок, и подвести итоги дуэлей в словах."""
+    for job in (shop_expire_roles, resolve_word_duels):
+        try:
+            await job()
+        except Exception as error:
+            await report_error(f"Фоновая проверка {job.__name__}", error)
+
+
+@fast_loop.before_loop
+@slow_loop.before_loop
+async def before_new_loops():
+    await bot.wait_until_ready()
 
 
 # Запуск бота. Эта строка "держит" программу работающей, пока её не остановят (Ctrl+C).
