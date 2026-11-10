@@ -9,36 +9,32 @@
 <body>
   <div class="splash" id="splash">
     <div class="splash-center">
-      <div class="splash-logo" aria-hidden="true">
-        <span>W</span><span>С</span><span>Ö</span><span>Л</span>
-      </div>
-      <h2>Слова из 5 букв</h2>
-      <p class="splash-games">Wortjagd · Словечко</p>
+      <div class="splash-logo" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+      <h2>Wortjagd · 5 букв</h2>
       <p class="splash-text" id="splash-text">Загружаем словарь…</p>
       <div class="progress"><div class="progress-bar" id="progress"></div></div>
-      <p class="tip"><b>Совет:</b> напиши <code>/wort</code> (немецкие слова) или <code>/slovo</code> (русские) в чате, чтобы играть вместе с друзьями</p>
+      <p class="tip"><code>/wort</code> — немецкие слова, <code>/slovo</code> — русские</p>
     </div>
     <footer class="splash-footer">The BakaSoft Solution Games</footer>
   </div>
+
+  <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->
+  <aside class="players" id="players" aria-label="Игроки"></aside>
+
   <main id="app">
     <header class="top">
-      <div class="brand">
-        <span class="logo" id="game-logo">W</span>
-        <div>
-          <h1 id="game-name">Wortjagd</h1>
-          <p class="sub" id="game-sub">Угадай немецкое слово из 5 букв</p>
-        </div>
-      </div>
+      <h1 id="game-name">Wortjagd</h1>
       <div class="langs" aria-label="Язык">
         <button class="lang" data-lang="de" title="Wortjagd — немецкие слова">DE</button>
-        <button class="lang" data-lang="ru" title="Словечко — русские слова">RU</button>
+        <button class="lang" data-lang="ru" title="5 букв — русские слова">RU</button>
       </div>
-      <div class="wallet" id="wallet" hidden>🪙 <span id="balance">0</span></div>
+      <div class="wallet" id="wallet" hidden><span id="balance">0</span> 🪙</div>
     </header>
 
     <nav class="modes">
-      <button class="mode" id="mode-daily" data-mode="daily">📅 Слово дня</button>
-      <button class="mode" id="mode-practice" data-mode="practice">🔁 Тренировка</button>
+      <button class="mode" id="mode-daily" data-mode="daily">Слово дня</button>
+      <button class="mode" id="mode-practice" data-mode="practice">Тренировка</button>
+      <button class="mode help-button" id="help-button" title="Как играть">?</button>
     </nav>
 
     <section class="board" id="board" aria-label="Поле игры"></section>
@@ -46,19 +42,22 @@
     <p class="status" id="status">Подключаюсь к Discord…</p>
 
     <section class="keyboard" id="keyboard" aria-label="Клавиатура"></section>
+  </main>
 
-    <details class="help">
-      <summary>Как играть</summary>
-      <p>Введи любое <span id="help-what">немецкое</span> слово из 5 букв и нажми <b>Enter</b>. Буквы подсветятся:</p>
+  <div class="help" id="help" hidden>
+    <div class="help-card">
+      <h3>Как играть</h3>
+      <p>Угадай <span id="help-what">немецкое</span> слово из 5 букв за 6 попыток. После каждой попытки буквы подсветятся:</p>
       <ul>
-        <li><span class="dot correct"></span> буква стоит на своём месте</li>
+        <li><span class="dot correct"></span> буква на своём месте</li>
         <li><span class="dot present"></span> буква есть в слове, но в другом месте</li>
-        <li><span class="dot absent"></span> такой буквы в слове нет</li>
+        <li><span class="dot absent"></span> такой буквы нет</li>
       </ul>
       <p id="rewards-text">Слово дня одно на весь сервер, сыграть можно раз в день, за победу дают монеты.
         Тренировка — без награды и без ограничений.</p>
-    </details>
-  </main>
+      <button class="mode" id="help-close">Понятно</button>
+    </div>
+  </div>
   <script src="static/app.js"></script>
 </body>
 </html>

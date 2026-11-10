@@ -1,4 +1,4 @@
-// Wortjagd (немецкие слова) и Словечко (русские слова) — мини-приложение Discord (Activity).
+// Wortjagd (немецкие слова) и «5 букв» (русские слова) — мини-приложение Discord (Activity).
 // Связь с Discord — по протоколу Embedded App SDK (сообщения postMessage окну Discord),
 // ходы и проверка слов — на сервере бота (/api/...), поэтому загаданное слово страница не знает.
 "use strict";
@@ -8,7 +8,7 @@ const ROWS = 6;
 // Всё, что отличается у двух игр: клавиатура и тексты
 const GAMES = {
   de: {
-    name: "Wortjagd", logo: "W", sub: "Угадай немецкое слово из 5 букв", what: "немецкое",
+    name: "Wortjagd", what: "немецкое",
     keys: [
       ["q", "w", "e", "r", "t", "z", "u", "i", "o", "p", "ü"],
       ["a", "s", "d", "f", "g", "h", "j", "k", "l", "ö", "ä"],
@@ -16,7 +16,7 @@ const GAMES = {
     ],
   },
   ru: {
-    name: "Словечко", logo: "С", sub: "Угадай русское слово из 5 букв", what: "русское",
+    name: "5 букв", what: "русское",
     keys: [
       ["й", "ц", "у", "к", "е", "н", "г", "ш", "щ", "з", "х", "ъ"],
       ["ф", "ы", "в", "а", "п", "р", "о", "л", "д", "ж", "э"],
@@ -139,9 +139,7 @@ function setLanguage(newLang) {
   LETTERS = new Set(game.keys.flat().filter((key) => key.length === 1));
   document.title = game.name;
   document.documentElement.lang = lang;
-  document.getElementById("game-logo").textContent = game.logo;
   document.getElementById("game-name").textContent = game.name;
-  document.getElementById("game-sub").textContent = game.sub;
   document.getElementById("help-what").textContent = game.what;
   for (const button of document.querySelectorAll(".lang")) {
     button.classList.toggle("active", button.dataset.lang === lang);
@@ -226,6 +224,63 @@ function shake() {
   row.classList.add("shake");
 }
 
+// ---------- Игроки слева сверху: кто сегодня играет и как подбирает слова ----------
+const playersEl = document.getElementById("players");
+let playersKey = "";  // чтобы не перерисовывать панель, если ничего не поменялось
+
+function miniBoard(marks) {
+  const grid = document.createElement("div");
+  grid.className = "mini";
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < LENGTH; c++) {
+      const cell = document.createElement("i");
+      if (marks[r]) cell.className = marks[r][c];
+      grid.appendChild(cell);
+    }
+  }
+  return grid;
+}
+
+function renderPlayers(data) {
+  const key = JSON.stringify(data.players);
+  if (key === playersKey) return;
+  playersKey = key;
+  playersEl.innerHTML = "";
+  for (const player of data.players) {
+    const card = document.createElement("div");
+    card.className = "player" + (player.me ? " me" : "") + (player.won ? " done" : player.finished ? " lost" : "");
+    card.title = player.name + (player.won ? " — угадал(а) за " + player.marks.length :
+      player.finished ? " — не угадал(а)" : " — играет");
+    const avatar = document.createElement("img");
+    avatar.className = "avatar";
+    avatar.alt = player.name;
+    avatar.src = "api/avatar/" + data.guild + "/" + player.id + ".png";
+    avatar.onerror = () => {  // нет аватарки — первая буква имени
+      const letter = document.createElement("div");
+      letter.className = "avatar";
+      letter.textContent = (player.name[0] || "?").toUpperCase();
+      avatar.replaceWith(letter);
+    };
+    card.append(avatar, miniBoard(player.marks));
+    playersEl.appendChild(card);
+  }
+}
+
+async function refreshPlayers() {
+  if (!session || document.hidden) return;
+  try {
+    renderPlayers(await api("api/players"));
+  } catch (error) {
+    // не страшно — попробуем в следующий раз
+  }
+}
+
+// ---------- Справка ----------
+const helpEl = document.getElementById("help");
+document.getElementById("help-button").addEventListener("click", () => { helpEl.hidden = false; });
+document.getElementById("help-close").addEventListener("click", () => { helpEl.hidden = true; });
+helpEl.addEventListener("click", (event) => { if (event.target === helpEl) helpEl.hidden = true; });
+
 // ---------- Ввод ----------
 async function press(key) {
   if (!state || busy || state.finished) return;
@@ -249,6 +304,7 @@ async function press(key) {
         typed = "";
         render(before);
         showGameStatus();
+        refreshPlayers();
       }
     } catch (error) {
       setStatus(error.message, "error");
@@ -264,8 +320,9 @@ async function press(key) {
 
 window.addEventListener("keydown", (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (!helpEl.hidden) return;
   let key = event.key.toLowerCase();
-  if (key === "ё") key = "е";  // в Словечке ё и е — одна буква
+  if (key === "ё") key = "е";  // в русской игре ё и е — одна буква
   if (key === "enter") press("enter");
   else if (key === "backspace") press("back");
   else if (LETTERS.has(key)) press(key);
@@ -278,10 +335,12 @@ async function newGame(body) {
   busy = true;
   try {
     state = (await api("api/new", body)).state;
+    if (state.lang !== lang) playersKey = "";
     setLanguage(state.lang);
     typed = "";
     render(-1);
     showGameStatus();
+    refreshPlayers();
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
@@ -289,7 +348,7 @@ async function newGame(body) {
   }
 }
 
-for (const button of document.querySelectorAll(".mode")) {
+for (const button of document.querySelectorAll(".mode[data-mode]")) {
   button.addEventListener("click", () => newGame({ mode: button.dataset.mode }));
 }
 for (const button of document.querySelectorAll(".lang")) {
@@ -326,6 +385,8 @@ async function start() {
     render(-1);
     showGameStatus();
     hideSplash();
+    refreshPlayers();
+    setInterval(refreshPlayers, 2000);  // поля других игроков обновляются почти сразу
   } catch (error) {
     loadingFailed("Не получилось войти: " + error.message);
   }

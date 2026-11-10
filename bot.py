@@ -215,6 +215,10 @@ timeouts = 1, 5, 10, 30, 60
 strike_reset_minutes = 60
 ; Писать ли в чат, что человек получил тайм-аут: on или off
 announce_timeouts = on
+; Автонаказания за варны: «сколько варнов: минут тайм-аута» через запятую. Например, 3: 60 — на 3-м варне
+; тайм-аут на час. Больше последнего порога — каждый новый варн снова даёт самый длинный тайм-аут.
+; off — варны ничего не делают сами, только записываются (/warns)
+warn_punishments = 3: 60, 5: 1440, 7: 10080
 
 [wortspiel]
 ; Игра Wortjagd (/wort): угадать немецкое слово из 5 букв за 6 попыток. Слова — в config/german_words.txt.
@@ -229,7 +233,7 @@ timezone = Europe/Berlin
 announce = on
 
 [slovo]
-; Игра Словечко (/slovo): угадать русское слово из 5 букв за 6 попыток. Слова — в config/russian_words.txt.
+; Игра «5 букв» (/slovo): угадать русское слово из 5 букв за 6 попыток. Слова — в config/russian_words.txt.
 ; Слово дня своё (не то же, что в Wortjagd) — можно сыграть в обе игры.
 ; Монеты за отгаданное слово дня: с 1-й попытки, со 2-й ... с 6-й (тренировка без награды)
 rewards = 500, 350, 250, 150, 100, 50
@@ -2440,6 +2444,24 @@ AI_DEFAULT_TIMEOUT = 10                 # минут, если модерато�
 MAX_MOD_ACTIONS = 3                     # больше наказаний за один ответ ИИ не выполняем
 
 
+def parse_warn_punishments(text):
+    """«3: 60, 5: 1440» → [(3, 60), (5, 1440)] — сколько варнов и сколько минут тайм-аута. off → []."""
+    pairs = sorted((int(count), int(minutes)) for count, minutes in re.findall(r"(\d+)\s*:\s*(\d+)", text))
+    return [] if text.strip().lower() in ("off", "нет", "no", "0") else pairs
+
+
+WARN_PUNISHMENTS = parse_warn_punishments(setting("moderation", "warn_punishments", "3: 60, 5: 1440, 7: 10080"))
+
+
+def warn_timeout_minutes(count):
+    """Сколько минут тайм-аута положено за варн номер count (0 — ничего)."""
+    if not WARN_PUNISHMENTS:
+        return 0
+    if count > WARN_PUNISHMENTS[-1][0]:
+        return WARN_PUNISHMENTS[-1][1]  # дальше последнего порога — каждый варн снова самый длинный тайм-аут
+    return dict(WARN_PUNISHMENTS).get(count, 0)
+
+
 def is_moderator(member):
     """Может ли человек просить бота о варнах и тайм-аутах."""
     perms = getattr(member, "guild_permissions", None)
@@ -2523,6 +2545,11 @@ async def run_mod_actions(text, user):
                 reason = rest or "без причины"
                 count = add_warn(guild.id, target.id, user.id, reason)
                 results.append(f"⚠️ {target.mention} получает варн №{count}: {reason}")
+                minutes = min(warn_timeout_minutes(count), 28 * 24 * 60)
+                if minutes:  # набралось варнов на автонаказание (settings.ini → warn_punishments)
+                    await target.timeout(datetime.timedelta(minutes=minutes),
+                                         reason=f"Варн №{count}: {reason} (выдал {user.display_name})")
+                    results.append(f"🔇 За {count}-й варн {target.mention} в тайм-ауте на {minutes_text(minutes)}.")
             elif kind == "ТАЙМАУТ":
                 match = re.match(r"(\d+)\s*(.*)", rest)
                 minutes = int(match[1]) if match else AI_DEFAULT_TIMEOUT
@@ -4482,7 +4509,7 @@ async def leave(interaction: discord.Interaction):
 
 
 # ============================================================
-#  ИГРЫ В СЛОВА ИЗ 5 БУКВ: Wortjagd — немецкие слова (/wort), Словечко — русские слова (/slovo)
+#  ИГРЫ В СЛОВА ИЗ 5 БУКВ: Wortjagd — немецкие слова (/wort), «5 букв» — русские слова (/slovo)
 #  У каждого 6 попыток. После каждой догадки буквы подсвечиваются:
 #  🟢 — буква на своём месте, 🟡 — буква есть в слове, но в другом месте, ⚫ — такой буквы нет.
 #  Слово дня — одно на весь сервер, за победу дают монеты (чем быстрее, тем больше), сыграть — раз в день.
@@ -4524,7 +4551,7 @@ WORD_LANGS = {
         "table": "word_daily", "summary_table": "word_summary", "seed": "", "button": "wortjagd:play",
     },
     "ru": {
-        "name": "Словечко", "command": "/slovo", "what": "русское слово", "language": "русском",
+        "name": "5 букв", "command": "/slovo", "what": "русское слово", "language": "русском",
         "letters": set("абвгдежзийклмнопрстуфхцчшщъыьэюя"),
         "path": os.path.join(CONFIG_DIR, "russian_words.txt"),
         "fallback": ["арбуз", "берег", "ветер", "война", "дождь", "замок", "зебра", "игрок", "книга", "кошка",
@@ -4834,42 +4861,53 @@ def word_summary_text(guild_id, today, lang):
     return head + "\n" + "\n".join(lines) + f"\nВчерашнее слово: ||{answer.upper()}||"
 
 
-WORD_COLORS = {"correct": (47, 166, 106), "present": (217, 154, 43), "absent": (70, 73, 84)}
+WORD_COLORS = {"correct": (59, 154, 104), "present": (199, 154, 50), "absent": (74, 77, 85)}  # как в мини-приложении
 
 
 def make_word_board_image(title, players):
-    """Картинка «Wortjagd №N»: карточка на каждого игрока — аватарка, имя, поле без букв и счёт.
-    players — список (имя, байты аватарки, подсветки догадок, подпись вроде «3/6»)."""
-    cell, gap, per_row = 24, 5, 5
-    card_w, card_h, pad = 176, 348, 22
+    """Картинка «Wortjagd №N» в минималистичном стиле: на каждого игрока — аватарка, поле из цветных
+    квадратиков (без букв), имя и счёт. players — список (имя, байты аватарки, подсветки догадок, «3/6»)."""
+    scale = 2  # рисуем вдвое крупнее — в Discord картинка получается чёткой
+    cell, gap, avatar_size, pad = 16 * scale, 3 * scale, 56 * scale, 14 * scale
+    grid_w = WORD_LENGTH * cell + (WORD_LENGTH - 1) * gap
+    grid_h = MAX_GUESSES * cell + (MAX_GUESSES - 1) * gap
+    card_w = pad + avatar_size + pad + grid_w + pad
+    card_h = pad + grid_h + 12 * scale + 18 * scale + pad
+    space, top, per_row = 10 * scale, 46 * scale, 4
     columns = min(len(players), per_row)
     rows = (len(players) + per_row - 1) // per_row
-    width = max(columns * card_w + (columns - 1) * 14 + pad * 2, 420)
-    height = 64 + rows * card_h + (rows - 1) * 14 + pad
-    image = Image.new("RGB", (width, height), (23, 24, 28))
+    width = columns * card_w + (columns - 1) * space + 2 * pad
+    height = top + rows * card_h + (rows - 1) * space + pad
+    background, line = (18, 19, 22), (44, 46, 52)
+    image = Image.new("RGB", (width, height), background)
     draw = ImageDraw.Draw(image)
-    draw.text((width / 2, 34), title, font=load_font(26, True), fill=(242, 243, 245), anchor="mm")
-    left0 = (width - (columns * card_w + (columns - 1) * 14)) // 2
-    name_font, score_font = load_font(17, True), load_font(18, True)
+    draw.text((pad, top / 2), title, font=load_font(17 * scale, True), fill=(236, 236, 238), anchor="lm")
+    name_font, score_font = load_font(14 * scale, True), load_font(14 * scale, True)
     for index, (name, avatar_bytes, rows_marks, score) in enumerate(players):
-        x = left0 + (index % per_row) * (card_w + 14)
-        y = 64 + (index // per_row) * (card_h + 14)
-        draw.rounded_rectangle((x, y, x + card_w, y + card_h), radius=22, fill=(30, 31, 37), outline=(58, 61, 70), width=2)
-        avatar = make_avatar(avatar_bytes, 84, name)
-        image.paste(avatar, (x + (card_w - 84) // 2, y + 16), avatar)
-        draw.text((x + card_w / 2, y + 118), fit_text(draw, name, name_font, card_w - 20), font=name_font,
-                  fill=(220, 222, 226), anchor="mm")
-        grid_w = WORD_LENGTH * cell + (WORD_LENGTH - 1) * gap
-        gx, gy = x + (card_w - grid_w) // 2, y + 138
+        x = pad + (index % per_row) * (card_w + space)
+        y = top + (index // per_row) * (card_h + space)
+        finished = score[0].isdigit() or score.startswith("X")
+        draw.rounded_rectangle((x, y, x + card_w, y + card_h), radius=8 * scale, outline=line, width=scale)
+        avatar = make_avatar(avatar_bytes, avatar_size, name)
+        image.paste(avatar, (x + pad, y + pad), avatar)
+        if score[0].isdigit():  # угадал — зелёное кольцо вокруг аватарки
+            draw.ellipse((x + pad - 3 * scale, y + pad - 3 * scale, x + pad + avatar_size + 3 * scale,
+                          y + pad + avatar_size + 3 * scale), outline=WORD_COLORS["correct"], width=2 * scale)
+        gx, gy = x + pad + avatar_size + pad, y + pad
         for r in range(MAX_GUESSES):
             for c in range(WORD_LENGTH):
-                box = (gx + c * (cell + gap), gy + r * (cell + gap), gx + c * (cell + gap) + cell, gy + r * (cell + gap) + cell)
+                box = (gx + c * (cell + gap), gy + r * (cell + gap),
+                       gx + c * (cell + gap) + cell - 1, gy + r * (cell + gap) + cell - 1)
                 if r < len(rows_marks):
-                    draw.rounded_rectangle(box, radius=6, fill=WORD_COLORS[rows_marks[r][c]])
+                    draw.rounded_rectangle(box, radius=2 * scale, fill=WORD_COLORS[rows_marks[r][c]])
                 else:
-                    draw.rounded_rectangle(box, radius=6, fill=(35, 37, 43), outline=(58, 61, 70), width=1)
-        draw.text((x + card_w / 2, y + card_h - 22), score, font=score_font,
-                  fill=(47, 166, 106) if score[0].isdigit() else (163, 166, 174), anchor="mm")
+                    draw.rounded_rectangle(box, radius=2 * scale, outline=line, width=scale)
+        text_y = y + pad + grid_h + 12 * scale + 9 * scale
+        score_w = draw.textlength(score, font=score_font)
+        draw.text((x + pad, text_y), fit_text(draw, name, name_font, card_w - 3 * pad - score_w), font=name_font,
+                  fill=(236, 236, 238), anchor="lm")
+        draw.text((x + card_w - pad, text_y), score, font=score_font, anchor="rm",
+                  fill=WORD_COLORS["correct"] if score[0].isdigit() else (139, 142, 150) if finished else (110, 113, 120))
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     return buffer.getvalue()
@@ -4984,7 +5022,7 @@ async def wort(interaction: discord.Interaction):
     await open_word_miniapp(interaction, "de")
 
 
-@bot.tree.command(name="slovo", description="Словечко: угадай русское слово из 5 букв (мини-приложение)")
+@bot.tree.command(name="slovo", description="5 букв: угадай русское слово из 5 букв (мини-приложение)")
 @app_commands.guild_only()
 async def slovo(interaction: discord.Interaction):
     await open_word_miniapp(interaction, "ru")
@@ -5095,6 +5133,66 @@ async def miniapp_new(request):
     return web.json_response({"state": word_game_state(game, session["guild"], session["member"])})
 
 
+word_members = {}  # (сервер, участник) → участник Discord (чтобы не спрашивать Discord при каждом обновлении)
+
+
+async def word_member(guild, user_id):
+    """Участник сервера по id: из памяти бота, из нашего запаса или (один раз) у Discord. None — не нашли."""
+    member = word_members.get((guild.id, user_id)) or guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.HTTPException:
+            return None
+    word_members[(guild.id, user_id)] = member
+    return member
+
+
+async def miniapp_players(request):
+    """Кто сегодня играет в слово дня этой игры на сервере: имя и цвета догадок (без букв) — для панели
+    слева сверху. Страница спрашивает раз в пару секунд, так что видно, как другие подбирают слова."""
+    session = miniapp_session(request)
+    guild = bot.get_guild(session["guild"])
+    lang = session["lang"]
+    info = WORD_LANGS[lang]
+    me = session["member"].id
+    word_members[(session["guild"], me)] = session["member"]
+    rows = db.execute(f"SELECT user_id, answer, guesses FROM {info['table']} WHERE guild_id = ? AND day = ?",
+                      (session["guild"], word_today(lang))).fetchall()
+    players = []
+    for user_id, answer, guesses in rows:
+        guesses = [guess for guess in guesses.split(",") if guess]
+        member = await word_member(guild, user_id) if guild else None
+        if member is None:
+            continue
+        won = bool(guesses) and guesses[-1] == answer
+        players.append({
+            "id": str(user_id), "name": member.display_name, "me": user_id == me,
+            "marks": [score_guess(guess, answer) for guess in guesses],
+            "won": won, "finished": won or len(guesses) >= MAX_GUESSES,
+        })
+    players.sort(key=lambda player: not player["me"])  # сам игрок — первым
+    return web.json_response({"players": players[:12], "guild": str(session["guild"])})
+
+
+async def miniapp_avatar(request):
+    """Аватарка участника из Discord (картинки с чужих сайтов внутри Discord-приложения не грузятся,
+    поэтому отдаём их со своего сервера)."""
+    guild = bot.get_guild(int(request.match_info["guild"]))
+    user_id = int(request.match_info["user"])
+    if guild is None:
+        raise web.HTTPNotFound()
+    if user_id not in word_avatars:
+        member = await word_member(guild, user_id)
+        if member is None:
+            raise web.HTTPNotFound()
+        word_avatars[user_id] = await get_avatar(member)
+    if not word_avatars[user_id]:
+        raise web.HTTPNotFound()
+    return web.Response(body=word_avatars[user_id], content_type="image/png",
+                        headers={"Cache-Control": "max-age=3600"})
+
+
 @web.middleware
 async def miniapp_errors(request, handler):
     """Ошибка в мини-приложении не роняет бота: пишем её в логи и отвечаем странице."""
@@ -5117,7 +5215,9 @@ async def start_miniapp():
     app = web.Application(middlewares=[miniapp_errors])
     app.add_routes([web.get("/", miniapp_index), web.get("/api/config", miniapp_config),
                     web.post("/api/token", miniapp_token), web.get("/api/state", miniapp_state),
-                    web.post("/api/guess", miniapp_guess), web.post("/api/new", miniapp_new)])
+                    web.post("/api/guess", miniapp_guess), web.post("/api/new", miniapp_new),
+                    web.get("/api/players", miniapp_players),
+                    web.get(r"/api/avatar/{guild:\d+}/{user:\d+}.png", miniapp_avatar)])
     app.router.add_static("/static/", os.path.dirname(MINIAPP_PAGE))  # style.css и app.js
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
