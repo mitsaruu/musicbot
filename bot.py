@@ -222,7 +222,7 @@ warn_punishments = 3: 60, 5: 1440, 7: 10080
 
 [wortspiel]
 ; Игра Wortjagd (/wort): угадать немецкое слово из 5 букв за 6 попыток. Слова — в config/german_words.txt.
-; Монеты за отгаданное слово дня: с 1-й попытки, со 2-й ... с 6-й (тренировка без награды)
+; Монеты за отгаданное слово дня: с 1-й попытки, со 2-й ... с 6-й
 rewards = 500, 350, 250, 150, 100, 50
 ; Какие слова принимать: wiktionary — из german_words.txt и любые настоящие немецкие слова (проверка
 ; в немецком Викисловаре), list — только из german_words.txt, off — любое сочетание из 5 букв
@@ -235,7 +235,7 @@ announce = on
 [slovo]
 ; Игра «5 букв» (/slovo): угадать русское слово из 5 букв за 6 попыток. Слова — в config/russian_words.txt.
 ; Слово дня своё (не то же, что в Wortjagd) — можно сыграть в обе игры.
-; Монеты за отгаданное слово дня: с 1-й попытки, со 2-й ... с 6-й (тренировка без награды)
+; Монеты за отгаданное слово дня: с 1-й попытки, со 2-й ... с 6-й
 rewards = 500, 350, 250, 150, 100, 50
 ; Какие слова принимать: wiktionary — из russian_words.txt и любые настоящие русские слова (проверка
 ; в русском Викисловаре), list — только из russian_words.txt, off — любое сочетание из 5 букв
@@ -4513,7 +4513,7 @@ async def leave(interaction: discord.Interaction):
 #  У каждого 6 попыток. После каждой догадки буквы подсвечиваются:
 #  🟢 — буква на своём месте, 🟡 — буква есть в слове, но в другом месте, ⚫ — такой буквы нет.
 #  Слово дня — одно на весь сервер, за победу дают монеты (чем быстрее, тем больше), сыграть — раз в день.
-#  Немецкое и русское слово дня — отдельные: можно сыграть в оба. Тренировка — случайные слова без награды.
+#  Немецкое и русское слово дня — отдельные: можно сыграть в оба.
 #  Играют в мини-приложении Discord (Activity — открывается прямо в Discord). В чате бот держит картинку
 #  с полями всех, кто играет в слово дня (обновляется после каждого хода), и кнопку «Играть!».
 #  Принимаются только настоящие слова: из словаря игры или из Викисловаря (немецкого / русского).
@@ -4700,15 +4700,9 @@ def current_word_game(guild_id, user_id, lang):
     return game
 
 
-def new_word_game(guild_id, user_id, mode, lang):
-    """mode="daily" — вернуться к слову дня, mode="practice" — тренировка со случайным словом."""
-    if mode == "practice":
-        words = game_words(lang)
-        today = daily_game(guild_id, user_id, lang).answer
-        answer = random.choice([word for word in words if word != today] or words)  # не подсказываем слово дня
-        game = WordGame(answer, False, lang=lang)
-    else:
-        game = daily_game(guild_id, user_id, lang)
+def new_word_game(guild_id, user_id, lang):
+    """Открыть слово дня нужной игры (например, переключились в мини-приложении с DE на RU)."""
+    game = daily_game(guild_id, user_id, lang)
     word_games[(guild_id, user_id, lang)] = game
     return game
 
@@ -4755,7 +4749,7 @@ async def make_word_guess(guild_id, member, text, lang):
     info = WORD_LANGS[lang]
     word = normalize_word(text, lang)
     game = current_word_game(guild_id, member.id, lang)
-    finished = "Эта партия уже закончена — начни тренировку или приходи за новым словом завтра."
+    finished = "Слово дня уже отгадано (или попытки кончились) — приходи за новым словом завтра."
     if game.finished:
         return game, finished
     if lang == "de" and "ß" in word:
@@ -4865,49 +4859,44 @@ WORD_COLORS = {"correct": (59, 154, 104), "present": (199, 154, 50), "absent": (
 
 
 def make_word_board_image(title, players):
-    """Картинка «Wortjagd №N» в минималистичном стиле: на каждого игрока — аватарка, поле из цветных
-    квадратиков (без букв), имя и счёт. players — список (имя, байты аватарки, подсветки догадок, «3/6»)."""
+    """Картинка для чата: на каждого игрока узкая карточка — сверху аватарка, под ней поле из цветных квадратиков
+    (без букв). Ничего лишнего: название игры и кто играет — в тексте сообщения над картинкой.
+    players — список (имя, байты аватарки, подсветки догадок, подпись вроде «3/6»); title не рисуем."""
     scale = 2  # рисуем вдвое крупнее — в Discord картинка получается чёткой
-    cell, gap, avatar_size, pad = 16 * scale, 3 * scale, 56 * scale, 14 * scale
+    cell, gap, avatar_size, pad = 15 * scale, 2 * scale, 80 * scale, 14 * scale
     grid_w = WORD_LENGTH * cell + (WORD_LENGTH - 1) * gap
     grid_h = MAX_GUESSES * cell + (MAX_GUESSES - 1) * gap
-    card_w = pad + avatar_size + pad + grid_w + pad
-    card_h = pad + grid_h + 12 * scale + 18 * scale + pad
-    space, top, per_row = 10 * scale, 46 * scale, 4
+    card_w = max(grid_w, avatar_size) + 2 * pad
+    card_h = pad + avatar_size + 16 * scale + grid_h + pad
+    space, outer, per_row = 12 * scale, 14 * scale, 6
     columns = min(len(players), per_row)
     rows = (len(players) + per_row - 1) // per_row
-    width = columns * card_w + (columns - 1) * space + 2 * pad
-    height = top + rows * card_h + (rows - 1) * space + pad
-    background, line = (18, 19, 22), (44, 46, 52)
+    width = columns * card_w + (columns - 1) * space + 2 * outer
+    height = rows * card_h + (rows - 1) * space + 2 * outer
+    background, line, empty = (18, 19, 22), (52, 54, 61), (44, 46, 52)
     image = Image.new("RGB", (width, height), background)
     draw = ImageDraw.Draw(image)
-    draw.text((pad, top / 2), title, font=load_font(17 * scale, True), fill=(236, 236, 238), anchor="lm")
-    name_font, score_font = load_font(14 * scale, True), load_font(14 * scale, True)
     for index, (name, avatar_bytes, rows_marks, score) in enumerate(players):
-        x = pad + (index % per_row) * (card_w + space)
-        y = top + (index // per_row) * (card_h + space)
-        finished = score[0].isdigit() or score.startswith("X")
-        draw.rounded_rectangle((x, y, x + card_w, y + card_h), radius=8 * scale, outline=line, width=scale)
-        avatar = make_avatar(avatar_bytes, avatar_size, name)
-        image.paste(avatar, (x + pad, y + pad), avatar)
-        if score[0].isdigit():  # угадал — зелёное кольцо вокруг аватарки
-            draw.ellipse((x + pad - 3 * scale, y + pad - 3 * scale, x + pad + avatar_size + 3 * scale,
-                          y + pad + avatar_size + 3 * scale), outline=WORD_COLORS["correct"], width=2 * scale)
-        gx, gy = x + pad + avatar_size + pad, y + pad
+        x = outer + (index % per_row) * (card_w + space)
+        y = outer + (index // per_row) * (card_h + space)
+        draw.rounded_rectangle((x, y, x + card_w - 1, y + card_h - 1), radius=16 * scale, outline=line, width=scale)
+        ax, ay = x + (card_w - avatar_size) // 2, y + pad
+        if avatar_bytes:
+            avatar = make_avatar(avatar_bytes, avatar_size, name)
+            image.paste(avatar, (ax, ay), avatar)
+        else:  # нет аватарки — спокойный серый кружок с первой буквой имени
+            draw.ellipse((ax, ay, ax + avatar_size, ay + avatar_size), fill=empty)
+            draw.text((ax + avatar_size / 2, ay + avatar_size / 2), (name[:1] or "?").upper(),
+                      font=load_font(32 * scale, True), fill=(139, 142, 150), anchor="mm")
+        gx, gy = x + (card_w - grid_w) // 2, y + pad + avatar_size + 16 * scale
         for r in range(MAX_GUESSES):
             for c in range(WORD_LENGTH):
                 box = (gx + c * (cell + gap), gy + r * (cell + gap),
                        gx + c * (cell + gap) + cell - 1, gy + r * (cell + gap) + cell - 1)
                 if r < len(rows_marks):
-                    draw.rounded_rectangle(box, radius=2 * scale, fill=WORD_COLORS[rows_marks[r][c]])
+                    draw.rectangle(box, fill=WORD_COLORS[rows_marks[r][c]])
                 else:
-                    draw.rounded_rectangle(box, radius=2 * scale, outline=line, width=scale)
-        text_y = y + pad + grid_h + 12 * scale + 9 * scale
-        score_w = draw.textlength(score, font=score_font)
-        draw.text((x + pad, text_y), fit_text(draw, name, name_font, card_w - 3 * pad - score_w), font=name_font,
-                  fill=(236, 236, 238), anchor="lm")
-        draw.text((x + card_w - pad, text_y), score, font=score_font, anchor="rm",
-                  fill=WORD_COLORS["correct"] if score[0].isdigit() else (139, 142, 150) if finished else (110, 113, 120))
+                    draw.rectangle(box, outline=empty, width=scale)
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     return buffer.getvalue()
@@ -5122,11 +5111,10 @@ async def miniapp_guess(request):
 async def miniapp_new(request):
     session = miniapp_session(request)
     body = await request.json()
-    mode = "practice" if body.get("mode") == "practice" else "daily"
     if body.get("lang") in WORD_LANGS:  # переключили язык прямо в игре
         session["lang"] = body["lang"]
         word_lang_choice[(session["guild"], session["member"].id)] = body["lang"]
-    game = new_word_game(session["guild"], session["member"].id, mode, session["lang"])
+    game = new_word_game(session["guild"], session["member"].id, session["lang"])
     channel = bot.get_channel(session["channel"] or 0)
     if game.daily and not game.finished and channel and "lang" in body:
         asyncio.create_task(word_board_update(channel, session["member"], game.lang))

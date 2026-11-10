@@ -190,14 +190,12 @@ function render(animateRow) {
     const mark = state && state.letters[button.dataset.key];
     button.className = "key" + (button.dataset.key.length > 1 ? " wide" : "") + (mark ? " " + mark : "");
   }
-  document.getElementById("mode-daily").classList.toggle("active", !!(state && state.daily));
-  document.getElementById("mode-practice").classList.toggle("active", !!(state && !state.daily));
   if (state) {
     document.getElementById("wallet").hidden = false;
     document.getElementById("balance").textContent = state.balance.toLocaleString("ru-RU");
     document.getElementById("rewards-text").textContent =
       "Слово дня одно на весь сервер, сыграть можно раз в день. Награда за победу с 1-й…" + state.max_guesses +
-      "-й попытки: " + state.rewards.join(" / ") + " монет. Тренировка — без награды и без ограничений.";
+      "-й попытки: " + state.rewards.join(" / ") + " монет.";
   }
 }
 
@@ -209,10 +207,10 @@ function showGameStatus() {
       (state.reward ? "! +" + state.reward + " монет" : "!"), "win");
   } else if (state.finished) {
     setStatus("😿 Попытки кончились. Было слово " + state.answer.toUpperCase() +
-      (state.daily ? ". Новое слово — завтра, а пока можно потренироваться." : ""), "error");
+      ". Новое слово — завтра.", "error");
   } else {
     const left = state.max_guesses - state.rows.length;
-    setStatus((state.daily ? "Слово дня. " : "Тренировка. ") + "Осталось попыток: " + left);
+    setStatus("Осталось попыток: " + left);
   }
 }
 
@@ -348,13 +346,10 @@ async function newGame(body) {
   }
 }
 
-for (const button of document.querySelectorAll(".mode[data-mode]")) {
-  button.addEventListener("click", () => newGame({ mode: button.dataset.mode }));
-}
 for (const button of document.querySelectorAll(".lang")) {
   // другая игра — сразу её слово дня
   button.addEventListener("click", () => {
-    if (button.dataset.lang !== lang) newGame({ mode: "daily", lang: button.dataset.lang });
+    if (button.dataset.lang !== lang) newGame({ lang: button.dataset.lang });
   });
 }
 

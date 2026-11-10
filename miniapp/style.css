@@ -44,13 +44,12 @@ h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: .04em; }
 .lang.active { background: var(--text); color: var(--bg); }
 .wallet { font-size: 14px; font-weight: 600; color: var(--muted); white-space: nowrap; }
 
-.modes { display: flex; gap: 6px; }
 .mode {
   flex: 1; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px;
   background: none; color: var(--muted); font-size: 13px; font-weight: 600;
 }
 .mode.active { color: var(--text); border-color: var(--line-strong); }
-.help-button { flex: 0 0 34px; padding: 7px 0; }
+.help-button { flex: 0 0 28px; padding: 3px 0; font-size: 12px; }
 
 /* ---------- Поле ---------- */
 .board {
