@@ -92,7 +92,7 @@ pub struct Data {
 impl Data {
     /// Собирает данные бота из базы и настроек. dir — папка бота.
     pub fn new(database: db::Database, settings: &config::Settings, dir: PathBuf, miniapp_ready: bool) -> Self {
-        let ytdlp = std::env::var("YTDLP").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| default_ytdlp(&dir));
+        let ytdlp = std::env::var("YTDLP").ok().filter(|value| !value.trim().is_empty()).map_or_else(|| default_ytdlp(&dir), |value| fix_ytdlp(&value));
         Self {
             db: std::sync::Arc::new(database),
             economy: economy::EconomySettings::load(settings),
@@ -131,6 +131,18 @@ fn default_ytdlp(dir: &std::path::Path) -> String {
         }
     }
     "yt-dlp".to_string()
+}
+
+/// YTDLP указывает просто на python (например, systemd отрезал «-m yt_dlp» после пробела) — дописываем модуль.
+fn fix_ytdlp(value: &str) -> String {
+    let value = value.trim();
+    let program = value.split_whitespace().next().unwrap_or("");
+    let name = std::path::Path::new(program).file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if name.starts_with("python") && !value.split_whitespace().any(|part| part == "-m") {
+        format!("{value} -m yt_dlp")
+    } else {
+        value.to_string()
+    }
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -396,6 +408,7 @@ async fn main() {
                     Some(secret) if miniapp_port > 0 => miniapp::start(ctx.clone(), data.clone(), secret, miniapp_host, miniapp_port),
                     _ => println!("Мини-приложение выключено: нет DISCORD_CLIENT_SECRET (или port = 0). /wort и /slovo не будут работать."),
                 }
+                println!("yt-dlp запускается так: {}", data.ytdlp);
                 println!("Бот запущен как {}", ready.user.name);
                 Ok(data)
             })
@@ -444,5 +457,9 @@ mod tests {
     fn ytdlp_default() {
         let dir = std::env::temp_dir().join("musicbot-ytdlp-test");
         assert_eq!(super::default_ytdlp(&dir), "yt-dlp");
+        assert_eq!(super::fix_ytdlp("/home/x/venv/bin/python"), "/home/x/venv/bin/python -m yt_dlp");
+        assert_eq!(super::fix_ytdlp(" python3 "), "python3 -m yt_dlp");
+        assert_eq!(super::fix_ytdlp("venv/bin/python -m yt_dlp"), "venv/bin/python -m yt_dlp");
+        assert_eq!(super::fix_ytdlp("/usr/local/bin/yt-dlp"), "/usr/local/bin/yt-dlp");
     }
 }
