@@ -232,7 +232,10 @@ fn ytdlp_command(data: &Data) -> tokio::process::Command {
 async fn search(data: &Data, query: &str) -> Result<(String, String), Error> {
     let mut command = ytdlp_command(data);
     command.args(["--no-playlist", "--no-warnings", "--format", "bestaudio/best", "--print", "title", "--print", "webpage_url"]).arg(ytdlp_target(query));
-    let output = tokio::time::timeout(Duration::from_secs(60), command.output()).await.map_err(|_| "yt-dlp думал дольше минуты")??;
+    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .await
+        .map_err(|_| "yt-dlp думал дольше минуты")?
+        .map_err(|error| format!("не получилось запустить yt-dlp (`{}`): {error}. Задай переменную YTDLP", data.ytdlp))?;
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     match (lines.next(), lines.next()) {
@@ -567,9 +570,14 @@ pub async fn play(
         }
         query = queries.into_iter().next().unwrap_or(query); // один трек ищем как «Исполнитель - Название»
     }
-    let Ok((title, url)) = search(data, &query).await else {
-        ctx.say("Не получилось найти или загрузить этот трек.").await?;
-        return Ok(());
+    let (title, url) = match search(data, &query).await {
+        Ok(found) => found,
+        Err(error) => {
+            report_error(ctx.http(), data, Some(guild), "Музыка: поиск /play", &error.to_string()).await;
+            let reason: String = error.to_string().chars().take(300).collect();
+            ctx.say(format!("Не получилось найти или загрузить этот трек: `{reason}`")).await?;
+            return Ok(());
+        }
     };
     let waiting = data.db.queue_count(guild.get())?;
     data.db.queue_add(guild.get(), &url, &title)?;

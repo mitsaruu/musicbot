@@ -3432,8 +3432,10 @@ async def play(interaction: discord.Interaction, query: str):
 
     try:
         _, title, page_url, _ = await search(query)  # ищем песню (ссылка на звук сейчас не нужна — "_")
-    except Exception:
-        await interaction.followup.send("Не получилось найти или загрузить этот трек.")
+    except Exception as error:
+        await report_error("Музыка: поиск /play", error, interaction.guild, interaction.user, interaction.channel)
+        reason = str(error).replace("\x1b[0;31m", "").replace("\x1b[0m", "").strip()[:300]  # yt-dlp красит текст
+        await interaction.followup.send(f"Не получилось найти или загрузить этот трек: `{reason or type(error).__name__}`")
         return
 
     idle = not vc.is_playing() and not vc.is_paused()  # сейчас ничего не играет?

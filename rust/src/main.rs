@@ -92,6 +92,7 @@ pub struct Data {
 impl Data {
     /// Собирает данные бота из базы и настроек. dir — папка бота.
     pub fn new(database: db::Database, settings: &config::Settings, dir: PathBuf, miniapp_ready: bool) -> Self {
+        let ytdlp = std::env::var("YTDLP").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| default_ytdlp(&dir));
         Self {
             db: std::sync::Arc::new(database),
             economy: economy::EconomySettings::load(settings),
@@ -113,11 +114,23 @@ impl Data {
             web: reqwest::Client::new(),
             blackjack_players: Default::default(),
             blackjack_shoes: Default::default(),
-            ytdlp: std::env::var("YTDLP").unwrap_or_else(|_| "yt-dlp".to_string()),
+            ytdlp,
             #[cfg(feature = "voice")]
             music: Default::default(),
         }
     }
+}
+
+/// Как запускать yt-dlp, если переменная YTDLP не задана: из venv рядом с ботом (как bot.py на сервере),
+/// а если его нет — программа yt-dlp из PATH.
+fn default_ytdlp(dir: &std::path::Path) -> String {
+    for python in [dir.join("venv").join("bin").join("python"), dir.join("venv").join("Scripts").join("python.exe")] {
+        let path = python.display().to_string();
+        if python.exists() && !path.contains(char::is_whitespace) {
+            return format!("{path} -m yt_dlp");
+        }
+    }
+    "yt-dlp".to_string()
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -148,12 +161,51 @@ async fn on_error(error: poise::FrameworkError<'_, Shared, Error>) {
             let reply = poise::CreateReply::default().content("😵 Что-то пошло не так. Ошибка записана в консоль.").ephemeral(true);
             let _ = ctx.send(reply).await;
         }
+        poise::FrameworkError::ArgumentParse { error, input, ctx, .. } => {
+            // Например, Discord прислал параметры в другом виде (команды зарегистрированы другой версией бота)
+            let details = format!("{error} (ввод: {input:?})");
+            println!("Не разобрала параметры /{}: {details}", ctx.command().name);
+            let place = format!("параметры команды /{}", ctx.command().name);
+            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
+            let text = "😵 Не поняла параметры команды. Если команды только что обновились — перезапусти Discord (Ctrl+R).";
+            let _ = ctx.send(poise::CreateReply::default().content(text).ephemeral(true)).await;
+        }
+        poise::FrameworkError::CommandCheckFailed { error: Some(error), ctx, .. } => {
+            println!("Ошибка в проверке перед /{}: {error:?}", ctx.command().name);
+        }
         other => {
+            println!("Ошибка: {other}");
             if let Err(error) = poise::builtins::on_error(other).await {
                 println!("Ошибка при обработке ошибки: {error}");
             }
         }
     }
+}
+
+/// Регистрирует команды глобально. Если в Developer Portal включены Activities, у приложения есть
+/// команда-«точка входа» (Entry Point, тип 4) — Discord не даёт удалить её при массовом обновлении,
+/// поэтому отправляем её вместе с нашими командами (так же делает bot.py). Возвращает, сколько наших команд.
+async fn register_globally(token: &str, app_id: u64, commands: &[poise::Command<Shared, Error>]) -> Result<usize, Error> {
+    let url = format!("https://discord.com/api/v10/applications/{app_id}/commands");
+    let web = reqwest::Client::new();
+    let auth = format!("Bot {token}");
+    let response = web.get(&url).header("Authorization", &auth).send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        return Err(format!("Discord не отдал список команд: {status} {text}").into());
+    }
+    let existing: Vec<serde_json::Value> = serde_json::from_str(&text)?;
+    let mut payload = serde_json::to_value(poise::builtins::create_application_commands(commands))?;
+    let ours = payload.as_array().map_or(0, Vec::len);
+    let entry_points: Vec<serde_json::Value> = existing.into_iter().filter(|command| command["type"] == 4).collect();
+    payload.as_array_mut().ok_or("список команд — не массив")?.extend(entry_points);
+    let response = web.put(&url).header("Authorization", &auth).header("Content-Type", "application/json").body(payload.to_string()).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Discord не принял команды: {status} {}", response.text().await.unwrap_or_default()).into());
+    }
+    Ok(ours)
 }
 
 /// Раз в 20 секунд: напоминания, у которых пришло время, и опросы, которые пора закрыть.
@@ -195,6 +247,7 @@ async fn main() {
     let test_guild = std::env::var("TEST_GUILD_ID").ok().and_then(|id| id.parse::<u64>().ok());
     let register_global = std::env::var("REGISTER_GLOBAL").is_ok_and(|value| value == "1");
 
+    let token_for_setup = token.clone();
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![
@@ -316,12 +369,17 @@ async fn main() {
         .setup(move |ctx, ready, framework| {
             Box::pin(async move {
                 let commands = &framework.options().commands;
+                // Не получилось зарегистрировать команды — бот всё равно работает (со списком команд, что уже в Discord)
                 if let Some(guild) = test_guild {
-                    poise::builtins::register_in_guild(ctx, commands, serenity::GuildId::new(guild)).await?;
-                    println!("Зарегистрировано слэш-команд на сервере {guild}: {}", commands.len());
+                    match poise::builtins::register_in_guild(ctx, commands, serenity::GuildId::new(guild)).await {
+                        Ok(()) => println!("Зарегистрировано слэш-команд на сервере {guild}: {}", commands.len()),
+                        Err(error) => println!("⚠️ Не получилось зарегистрировать команды на сервере {guild}: {error}"),
+                    }
                 } else if register_global {
-                    poise::builtins::register_globally(ctx, commands).await?;
-                    println!("Зарегистрировано слэш-команд глобально: {}", commands.len());
+                    match register_globally(&token_for_setup, ready.application.id.get(), commands).await {
+                        Ok(count) => println!("Зарегистрировано слэш-команд глобально: {count}"),
+                        Err(error) => println!("⚠️ Не получилось зарегистрировать команды глобально: {error}"),
+                    }
                 } else {
                     println!("Команды не регистрировал: задай TEST_GUILD_ID (сервер для проверки) или REGISTER_GLOBAL=1.");
                 }
@@ -364,5 +422,27 @@ async fn main() {
             }
         }
         Err(error) => println!("Не получилось создать клиент Discord: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Список команд для Discord собирается в JSON, который принимает массовое обновление (PUT).
+    #[test]
+    fn command_payload() {
+        let commands = vec![super::economy::coinflip(), super::admin::set_games_channel()];
+        let payload = serde_json::to_value(poise::builtins::create_application_commands(&commands)).unwrap();
+        let list = payload.as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["name"], "coinflip");
+        assert_eq!(list[0]["options"].as_array().unwrap().len(), 2);
+        assert_eq!(list[1]["name"], "games_channel");
+        assert_eq!(list[1]["default_member_permissions"], "32"); // Manage Server
+    }
+
+    #[test]
+    fn ytdlp_default() {
+        let dir = std::env::temp_dir().join("musicbot-ytdlp-test");
+        assert_eq!(super::default_ytdlp(&dir), "yt-dlp");
     }
 }
