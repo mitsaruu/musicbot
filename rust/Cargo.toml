@@ -1,0 +1,40 @@
+[package]
+name = "musicbot"
+version = "0.1.0"
+edition = "2021"
+description = "Discord-бот на Rust (переписывается с bot.py по частям)"
+
+[dependencies]
+# Discord: poise — слэш-команды поверх serenity
+poise = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+# Та же база levels.db, что и у bot.py. bundled — SQLite собирается вместе с ботом, ставить его отдельно не нужно
+rusqlite = { version = "0.41", features = ["bundled"] }
+rand = "0.9"
+chrono = "0.4"
+chrono-tz = "0.10"
+# Картинки (/rank, таблицы рейтингов): рисование и шрифты
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+ab_glyph = "0.2"
+# Мини-приложение игры в слова: веб-сервер и JSON
+axum = "0.8"
+serde_json = "1"
+# Картинки для ИИ отправляются в Gemini в виде base64
+base64 = "0.22"
+# Скачивание аватарок
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Голос: songbird 0.6+ умеет шифрование DAVE, без которого Discord не пускает в голосовые каналы
+# Для сборки нужен CMake (собирает кодек Opus). Без музыки: cargo build --no-default-features
+songbird = { version = "0.6", features = ["builtin-queue"], optional = true }
+symphonia = { version = "0.5", features = ["mkv", "isomp4", "aac", "mp3", "ogg", "vorbis"], optional = true }
+# Обработчик «трек закончился» для songbird
+async-trait = { version = "0.1", optional = true }
+
+[features]
+default = ["voice"]
+# Музыка в голосовых каналах
+voice = ["dep:songbird", "dep:symphonia", "dep:async-trait"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

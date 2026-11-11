@@ -9,3 +9,6 @@ venv/
 
 # Логи ошибок бота
 bot.log*
+
+# Сборка Rust-версии бота
+rust/target/
